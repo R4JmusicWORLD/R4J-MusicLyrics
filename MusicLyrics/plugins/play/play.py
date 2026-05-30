@@ -375,52 +375,33 @@ async def _resolve_query(query: str, platform: str, msg: Message):
         return info, media_path, is_stream
 
     # -- Plain text query --
-    # Try YouTube FIRST (most accurate song match),
-    # then fallback to JioSaavn + SoundCloud concurrently.
+    # SPEED OPTIMISED: Search YouTube + get stream URL + JioSaavn
+    # ALL CONCURRENTLY.  Stream URLs give instant playback (no download).
+    # Download only as last resort fallback.
 
     import asyncio as _aio
 
-    # ── Step 1: YouTube first ──
-    LOG.info("Query search: trying YouTube FIRST for: %s", query)
-    try:
-        filepath, dl_info = await search_and_download_audio(query)
-        if filepath and dl_info:
-            return dl_info, filepath, False
-    except Exception:
-        pass
+    LOG.info("Query search: trying YouTube + JioSaavn CONCURRENTLY for: %s", query)
 
-    try:
-        yt = await search_youtube(query)
-        if yt:
-            if yt["duration"] <= Config.DURATION_LIMIT_MIN * 60 or yt["duration"] <= 0:
-                media_path, is_stream = await _get_audio_media(yt["url"])
-                if media_path:
-                    return yt, media_path, is_stream
-    except Exception:
-        pass
-
-    # ── Step 2: YouTube failed — try JioSaavn + SoundCloud concurrently ──
-    LOG.info("YouTube failed, trying JioSaavn + SoundCloud concurrently for: %s", query)
-
-    async def _try_jiosaavn_query():
-        """Try JioSaavn search+download."""
+    # ── Step 1: Search + stream URL across platforms concurrently ──
+    async def _yt_search_and_stream():
+        """Search YouTube and get stream URL (fastest — no download wait)."""
         try:
-            js_path, js_info = await search_and_download_jiosaavn(query)
-            if js_path and js_info:
-                import os as _os
-                if _os.path.isfile(js_path):
-                    info = {
-                        "title": js_info.get("title", "Unknown"),
-                        "url": js_info.get("url", ""),
-                        "duration": js_info.get("duration", 0),
-                        "thumbnail": js_info.get("thumbnail", ""),
-                        "channel": js_info.get("artist", ""),
-                        "platform": "jiosaavn",
-                    }
-                    return info, js_path, False
+            yt = await search_youtube(query)
+            if not yt:
+                return None
+            if yt["duration"] > Config.DURATION_LIMIT_MIN * 60 and yt["duration"] > 0:
+                return None
+            stream_url = await get_audio_stream_url(yt["url"])
+            if stream_url:
+                return yt, stream_url, True
         except Exception:
             pass
-        # Try JioSaavn stream URL
+        return None
+
+    async def _jiosaavn_search_and_stream():
+        """Search JioSaavn — CDN URL gives instant playback for Indian songs."""
+        # Try stream URL first (no download needed)
         try:
             js_search = await search_jiosaavn(query)
             if js_search and js_search.get("download_url"):
@@ -435,26 +416,29 @@ async def _resolve_query(query: str, platform: str, msg: Message):
                 return info, js_search["download_url"], True
         except Exception:
             pass
-        return None
-
-    async def _try_soundcloud_query():
-        """Try SoundCloud search+download."""
+        # Fallback: download
         try:
-            sc_path, sc_info = await search_and_download_soundcloud(query)
-            if sc_path and sc_info:
-                is_stream = bool(sc_info.get("_is_stream_url"))
-                if is_stream or os.path.isfile(str(sc_path)):
-                    return sc_info, sc_path, is_stream
+            js_path, js_info = await search_and_download_jiosaavn(query)
+            if js_path and js_info and os.path.isfile(js_path):
+                info = {
+                    "title": js_info.get("title", "Unknown"),
+                    "url": js_info.get("url", ""),
+                    "duration": js_info.get("duration", 0),
+                    "thumbnail": js_info.get("thumbnail", ""),
+                    "channel": js_info.get("artist", ""),
+                    "platform": "jiosaavn",
+                }
+                return info, js_path, False
         except Exception:
             pass
         return None
 
-    tasks = [
-        _aio.create_task(_try_jiosaavn_query()),
-        _aio.create_task(_try_soundcloud_query()),
+    stream_tasks = [
+        _aio.create_task(_yt_search_and_stream()),
+        _aio.create_task(_jiosaavn_search_and_stream()),
     ]
 
-    pending = set(tasks)
+    pending = set(stream_tasks)
     while pending:
         done, pending = await _aio.wait(pending, return_when=_aio.FIRST_COMPLETED)
         for task in done:
@@ -467,8 +451,25 @@ async def _resolve_query(query: str, platform: str, msg: Message):
             except Exception:
                 pass
 
-    for t in tasks:
-        t.cancel()
+    # ── Step 2: Stream URLs failed — try yt-dlp search+download as fallback ──
+    LOG.info("Stream URLs failed, trying yt-dlp download for: %s", query)
+    try:
+        filepath, dl_info = await search_and_download_audio(query)
+        if filepath and dl_info:
+            return dl_info, filepath, False
+    except Exception:
+        pass
+
+    # ── Step 3: SoundCloud as last resort ──
+    LOG.info("All failed, trying SoundCloud for: %s", query)
+    try:
+        sc_path, sc_info = await search_and_download_soundcloud(query)
+        if sc_path and sc_info:
+            is_stream = bool(sc_info.get("_is_stream_url"))
+            if is_stream or os.path.isfile(str(sc_path)):
+                return sc_info, sc_path, is_stream
+    except Exception:
+        pass
 
     raise ValueError("কোনো result পাওয়া যায়নি। অন্য keyword দিয়ে চেষ্টা করুন।")
 
@@ -497,13 +498,13 @@ async def play_command(client: Client, message: Message):
             "`/play Arijit Singh Tum Hi Ho`\n"
             "`/play https://youtu.be/...`"
         )
-        await _add_reaction(chat_id, usage_msg.id)
+        await _add_reaction(chat_id, message.id)
         return
 
     status_msg = await message.reply_text(
         f"🔍 **খুঁজছি:** `{query[:80]}`\n\nঅপেক্ষা করুন..."
     )
-    await _add_reaction(chat_id, status_msg.id)
+    await _add_reaction(chat_id, message.id)
 
     platform = _detect_platform(query)
 
@@ -562,7 +563,7 @@ async def play_command(client: Client, message: Message):
             f"🦋 ✦ᴘᴏᴡєʀєᴅ ʙʏ » ── [@R4J_81](https://t.me/R4J_81)",
             reply_markup=_control_keyboard(color),
         )
-        await _add_reaction(chat_id, status_msg.id)
+        await _add_reaction(chat_id, message.id)
         return
 
     # Start streaming
@@ -622,25 +623,20 @@ async def play_command(client: Client, message: Message):
             if chat_id not in _now_playing_messages:
                 _now_playing_messages[chat_id] = []
             _now_playing_messages[chat_id].append(now_playing_msg)
-            await _add_reaction(chat_id, now_playing_msg.id)
+            await _add_reaction(chat_id, message.id)
         else:
             await status_msg.edit_text(text, reply_markup=_control_keyboard(color))
             # Track this message
             if chat_id not in _now_playing_messages:
                 _now_playing_messages[chat_id] = []
             _now_playing_messages[chat_id].append(status_msg)
-            await _add_reaction(chat_id, status_msg.id)
+            await _add_reaction(chat_id, message.id)
     except Exception:
         await status_msg.edit_text(text, reply_markup=_control_keyboard(color))
         if chat_id not in _now_playing_messages:
             _now_playing_messages[chat_id] = []
         _now_playing_messages[chat_id].append(status_msg)
-        await _add_reaction(chat_id, status_msg.id)
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# /playforce — Stop current playback and force-play a new song immediately
-# ══════════════════════════════════════════════════════════════════════════════
+        await _add_reaction(chat_id, message.id)
 
 @bot.on_message(filters.command(["playforce", "pf", "forceplay"]) & not_edited)
 async def playforce_command(client: Client, message: Message):
@@ -664,13 +660,13 @@ async def playforce_command(client: Client, message: Message):
             "Example:\n"
             "`/playforce Arijit Singh Tum Hi Ho`"
         )
-        await _add_reaction(chat_id, usage_msg.id)
+        await _add_reaction(chat_id, message.id)
         return
 
     status_msg = await message.reply_text(
         f"⚡ **Force Play:** `{query[:80]}`\n\nবর্তমান গান বন্ধ করছি..."
     )
-    await _add_reaction(chat_id, status_msg.id)
+    await _add_reaction(chat_id, message.id)
 
     # Stop current playback if active
     if is_active(chat_id):
@@ -786,16 +782,16 @@ async def playforce_command(client: Client, message: Message):
             if chat_id not in _now_playing_messages:
                 _now_playing_messages[chat_id] = []
             _now_playing_messages[chat_id].append(now_playing_msg)
-            await _add_reaction(chat_id, now_playing_msg.id)
+            await _add_reaction(chat_id, message.id)
         else:
             await status_msg.edit_text(text, reply_markup=_control_keyboard(color))
             if chat_id not in _now_playing_messages:
                 _now_playing_messages[chat_id] = []
             _now_playing_messages[chat_id].append(status_msg)
-            await _add_reaction(chat_id, status_msg.id)
+            await _add_reaction(chat_id, message.id)
     except Exception:
         await status_msg.edit_text(text, reply_markup=_control_keyboard(color))
         if chat_id not in _now_playing_messages:
             _now_playing_messages[chat_id] = []
         _now_playing_messages[chat_id].append(status_msg)
-        await _add_reaction(chat_id, status_msg.id)
+        await _add_reaction(chat_id, message.id)

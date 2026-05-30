@@ -374,7 +374,7 @@ async def _check_stream_url(url: str) -> bool:
     """Quick HEAD check to see if a stream URL is still valid.
 
     Returns True if URL is reachable (2xx/3xx), False otherwise.
-    SPEED OPTIMISED: 4s timeout, HEAD-only, assume OK on timeout.
+    SPEED OPTIMISED: 2s timeout, HEAD-only, assume OK on timeout.
     """
     if not _is_url(url):
         return True  # Not a URL, skip check
@@ -384,7 +384,7 @@ async def _check_stream_url(url: str) -> bool:
             try:
                 async with session.head(
                     url,
-                    timeout=aiohttp.ClientTimeout(total=2, connect=1.5),
+                    timeout=aiohttp.ClientTimeout(total=1.5, connect=1),
                     allow_redirects=True,
                 ) as resp:
                     if resp.status < 400:

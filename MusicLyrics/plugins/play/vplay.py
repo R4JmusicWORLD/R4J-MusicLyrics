@@ -357,13 +357,13 @@ async def vplay_command(client: Client, message: Message):
             "Video সহ voice chat-এ stream করবে।\n\n"
             "Example: `/vplay Arijit Singh live`"
         )
-        await _add_reaction(chat_id, usage_msg.id)
+        await _add_reaction(chat_id, message.id)
         return
 
     status_msg = await message.reply_text(
         f"🎬 **Video খুঁজছি:** `{query[:80]}`\n\nঅপেক্ষা করুন..."
     )
-    await _add_reaction(chat_id, status_msg.id)
+    await _add_reaction(chat_id, message.id)
 
     platform = _detect_platform(query)
 
@@ -419,7 +419,7 @@ async def vplay_command(client: Client, message: Message):
             f"**Requested by:** {requester}",
             reply_markup=_control_keyboard(color),
         )
-        await _add_reaction(chat_id, status_msg.id)
+        await _add_reaction(chat_id, message.id)
         return
 
     try:
@@ -478,14 +478,14 @@ async def vplay_command(client: Client, message: Message):
             if chat_id not in _now_playing_messages:
                 _now_playing_messages[chat_id] = []
             _now_playing_messages[chat_id].append(now_playing_msg)
-            await _add_reaction(chat_id, now_playing_msg.id)
+            await _add_reaction(chat_id, message.id)
         else:
             await status_msg.edit_text(text, reply_markup=_control_keyboard(color))
             # Track this message
             if chat_id not in _now_playing_messages:
                 _now_playing_messages[chat_id] = []
             _now_playing_messages[chat_id].append(status_msg)
-            await _add_reaction(chat_id, status_msg.id)
+            await _add_reaction(chat_id, message.id)
     except Exception:
         await status_msg.edit_text(text, reply_markup=_control_keyboard(color))
         if chat_id not in _now_playing_messages:

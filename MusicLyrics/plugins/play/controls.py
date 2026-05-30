@@ -60,14 +60,14 @@ async def pause_cmd(client: Client, message: Message):
     chat_id = message.chat.id
     if not is_active(chat_id):
         reply = await message.reply_text("❌ কিছু চলছে না এখন।")
-        await _add_reaction(chat_id, reply.id)
+        await _add_reaction(chat_id, message.id)
         return
     ok = await pause_stream(chat_id)
     if ok:
         reply = await message.reply_text("⏸ **Paused!**\nResume করতে `/resume` দিন।")
     else:
         reply = await message.reply_text("❌ Pause করা যায়নি।")
-    await _add_reaction(chat_id, reply.id)
+    await _add_reaction(chat_id, message.id)
 
 
 # ── /resume ──────────────────────────────────────────────────────────────────
@@ -77,14 +77,14 @@ async def resume_cmd(client: Client, message: Message):
     chat_id = message.chat.id
     if not is_active(chat_id):
         reply = await message.reply_text("❌ কিছু চলছে না এখন।")
-        await _add_reaction(chat_id, reply.id)
+        await _add_reaction(chat_id, message.id)
         return
     ok = await resume_stream(chat_id)
     if ok:
         reply = await message.reply_text("▶️ **Resumed!**")
     else:
         reply = await message.reply_text("❌ Resume করা যায়নি।")
-    await _add_reaction(chat_id, reply.id)
+    await _add_reaction(chat_id, message.id)
 
 
 # ── /skip | /next ────────────────────────────────────────────────────────────
@@ -94,7 +94,7 @@ async def skip_cmd(client: Client, message: Message):
     chat_id = message.chat.id
     if not is_active(chat_id):
         reply = await message.reply_text("❌ কিছু চলছে না এখন।")
-        await _add_reaction(chat_id, reply.id)
+        await _add_reaction(chat_id, message.id)
         return
 
     # Acquire skip lock to prevent race with auto-next
@@ -119,7 +119,7 @@ async def skip_cmd(client: Client, message: Message):
                 "✅ **Queue শেষ হয়ে গেছে!**\n\n"
                 "Voice chat থেকে বের হচ্ছি।"
             )
-            await _add_reaction(chat_id, reply.id)
+            await _add_reaction(chat_id, message.id)
             return
 
         try:
@@ -131,7 +131,7 @@ async def skip_cmd(client: Client, message: Message):
             success = await _fresh_resolve_and_play(chat_id, next_item)
             if not success:
                 reply = await message.reply_text("❌ পরের গানে যেতে সমস্যা হয়েছে।")
-                await _add_reaction(chat_id, reply.id)
+                await _add_reaction(chat_id, message.id)
                 return
 
             # Start progress timer for the new track
@@ -148,7 +148,7 @@ async def skip_cmd(client: Client, message: Message):
                 f"🦋 ✦ᴘᴏᴡєʀєᴅ ʙʏ » ── [@R4J_81](https://t.me/R4J_81)",
                 reply_markup=_control_keyboard(color),
             )
-            await _add_reaction(chat_id, reply.id)
+            await _add_reaction(chat_id, message.id)
             # Track this new "Now Playing" message
             if chat_id not in _now_playing_messages:
                 _now_playing_messages[chat_id] = []
@@ -156,7 +156,7 @@ async def skip_cmd(client: Client, message: Message):
         except Exception:
             LOG.exception("Skip failed in %s", chat_id)
             reply = await message.reply_text("❌ পরের গানে যেতে সমস্যা হয়েছে।")
-            await _add_reaction(chat_id, reply.id)
+            await _add_reaction(chat_id, message.id)
 
 
 # ── /stop | /end ─────────────────────────────────────────────────────────────
@@ -166,7 +166,7 @@ async def stop_cmd(client: Client, message: Message):
     chat_id = message.chat.id
     if not is_active(chat_id):
         reply = await message.reply_text("❌ কিছু চলছে না এখন।")
-        await _add_reaction(chat_id, reply.id)
+        await _add_reaction(chat_id, message.id)
         return
 
     # Acquire skip lock to prevent race with auto-next
@@ -189,7 +189,7 @@ async def stop_cmd(client: Client, message: Message):
             "⏹ **Stopped!**\n\n"
             "✅ Queue clear করে voice chat থেকে বের হয়ে গেছি।"
         )
-        await _add_reaction(chat_id, reply.id)
+        await _add_reaction(chat_id, message.id)
 
 
 # ── /seek <seconds> ──────────────────────────────────────────────────────────
@@ -199,17 +199,17 @@ async def seek_cmd(client: Client, message: Message):
     chat_id = message.chat.id
     if not is_active(chat_id):
         reply = await message.reply_text("❌ কিছু চলছে না এখন।")
-        await _add_reaction(chat_id, reply.id)
+        await _add_reaction(chat_id, message.id)
         return
     if len(message.command) < 2:
         reply = await message.reply_text("**Usage:** `/seek <seconds>`")
-        await _add_reaction(chat_id, reply.id)
+        await _add_reaction(chat_id, message.id)
         return
     try:
         seconds = int(message.command[1])
     except ValueError:
         reply = await message.reply_text("❌ সঠিক সংখ্যা দিন। Example: `/seek 30`")
-        await _add_reaction(chat_id, reply.id)
+        await _add_reaction(chat_id, message.id)
         return
     ok = await seek_stream(chat_id, seconds)
     if ok:
@@ -218,7 +218,7 @@ async def seek_cmd(client: Client, message: Message):
         reply = await message.reply_text(
             "❌ Seek এখনো এই version-এ fully supported নয়।"
         )
-    await _add_reaction(chat_id, reply.id)
+    await _add_reaction(chat_id, message.id)
 
 
 # ── /volume <1-200> ──────────────────────────────────────────────────────────
@@ -228,28 +228,28 @@ async def volume_cmd(client: Client, message: Message):
     chat_id = message.chat.id
     if not is_active(chat_id):
         reply = await message.reply_text("❌ কিছু চলছে না এখন।")
-        await _add_reaction(chat_id, reply.id)
+        await _add_reaction(chat_id, message.id)
         return
     if len(message.command) < 2:
         reply = await message.reply_text("**Usage:** `/volume <1-200>`")
-        await _add_reaction(chat_id, reply.id)
+        await _add_reaction(chat_id, message.id)
         return
     try:
         vol = int(message.command[1])
     except ValueError:
         reply = await message.reply_text("❌ সঠিক সংখ্যা দিন (1-200)।")
-        await _add_reaction(chat_id, reply.id)
+        await _add_reaction(chat_id, message.id)
         return
     if not 1 <= vol <= 200:
         reply = await message.reply_text("❌ Volume 1 থেকে 200 এর মধ্যে হতে হবে।")
-        await _add_reaction(chat_id, reply.id)
+        await _add_reaction(chat_id, message.id)
         return
     ok = await set_volume(chat_id, vol)
     if ok:
         reply = await message.reply_text(f"🔊 Volume **{vol}%** সেট হয়েছে।")
     else:
         reply = await message.reply_text("❌ Volume পরিবর্তন করা যায়নি।")
-    await _add_reaction(chat_id, reply.id)
+    await _add_reaction(chat_id, message.id)
 
 
 # ── /queue ───────────────────────────────────────────────────────────────────
@@ -260,7 +260,7 @@ async def queue_cmd(client: Client, message: Message):
     items = await get_queue(chat_id)
     if not items:
         reply = await message.reply_text("📜 Queue খালি আছে।")
-        await _add_reaction(chat_id, reply.id)
+        await _add_reaction(chat_id, message.id)
         return
     cq = await get_chat_queue(chat_id)
     lines = ["**📜 Current Queue:**\n"]
@@ -272,7 +272,7 @@ async def queue_cmd(client: Client, message: Message):
     loop_status = "🔁 Loop: ON" if cq.loop_mode else "🔁 Loop: OFF"
     lines.append(f"\n{loop_status}")
     reply = await message.reply_text("\n".join(lines))
-    await _add_reaction(chat_id, reply.id)
+    await _add_reaction(chat_id, message.id)
 
 
 # ── /nowplaying | /np ────────────────────────────────────────────────────────
@@ -283,7 +283,7 @@ async def nowplaying_cmd(client: Client, message: Message):
     current = await get_current(chat_id)
     if not current:
         reply = await message.reply_text("❌ এখন কিছু চলছে না।")
-        await _add_reaction(chat_id, reply.id)
+        await _add_reaction(chat_id, message.id)
         return
     dur = format_duration(current.duration)
     color = _get_next_color()
@@ -302,7 +302,7 @@ async def nowplaying_cmd(client: Client, message: Message):
         )
     else:
         reply = await message.reply_text(text, reply_markup=_control_keyboard(color))
-    await _add_reaction(chat_id, reply.id)
+    await _add_reaction(chat_id, message.id)
 
 
 # ── /loop ────────────────────────────────────────────────────────────────────
@@ -315,7 +315,7 @@ async def loop_cmd(client: Client, message: Message):
         reply = await message.reply_text("🔁 **Loop ON** — বর্তমান গান বারবার চলবে।")
     else:
         reply = await message.reply_text("🔁 **Loop OFF** — Queue স্বাভাবিকভাবে চলবে।")
-    await _add_reaction(chat_id, reply.id)
+    await _add_reaction(chat_id, message.id)
 
 
 # ── /shuffle ─────────────────────────────────────────────────────────────────
@@ -326,11 +326,11 @@ async def shuffle_cmd(client: Client, message: Message):
     items = await get_queue(chat_id)
     if len(items) < 2:
         reply = await message.reply_text("❌ Shuffle করার জন্য queue-তে কমপক্ষে ২টা গান থাকা দরকার।")
-        await _add_reaction(chat_id, reply.id)
+        await _add_reaction(chat_id, message.id)
         return
     await shuffle_queue(chat_id)
     reply = await message.reply_text("🔀 **Queue shuffle হয়ে গেছে!**")
-    await _add_reaction(chat_id, reply.id)
+    await _add_reaction(chat_id, message.id)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -410,7 +410,6 @@ async def cb_skip(client: Client, callback: CallbackQuery):
                     "✅ **Queue শেষ হয়ে গেছে!**\n\n"
                     "Voice chat থেকে বের হচ্ছি।"
                 )
-                await _add_reaction(chat_id, reply.id)
             except Exception:
                 pass
             await leave_voice_chat(chat_id)
@@ -426,7 +425,6 @@ async def cb_skip(client: Client, callback: CallbackQuery):
             if not success:
                 try:
                     err_reply = await callback.message.reply_text("❌ Skip করা যায়নি। আবার চেষ্টা করুন।")
-                    await _add_reaction(chat_id, err_reply.id)
                 except Exception:
                     pass
                 return
@@ -445,7 +443,6 @@ async def cb_skip(client: Client, callback: CallbackQuery):
                 f"🦋 ✦ᴘᴏᴡєʀєᴅ ʙʏ » ── [@R4J_81](https://t.me/R4J_81)",
                 reply_markup=_control_keyboard(color),
             )
-            await _add_reaction(chat_id, reply.id)
             # Track this new "Now Playing" message
             if chat_id not in _now_playing_messages:
                 _now_playing_messages[chat_id] = []
@@ -454,7 +451,6 @@ async def cb_skip(client: Client, callback: CallbackQuery):
             LOG.exception("Skip callback failed in %s", chat_id)
             try:
                 err_reply = await callback.message.reply_text("❌ Skip করা যায়নি। আবার চেষ্টা করুন।")
-                await _add_reaction(chat_id, err_reply.id)
             except Exception:
                 pass
 
