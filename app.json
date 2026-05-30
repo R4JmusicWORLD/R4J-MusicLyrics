@@ -1,0 +1,141 @@
+{
+  "name": "MusicLyrics",
+  "description": "A powerful Telegram music streaming bot for voice chats with group management, games, and security features.",
+  "logo": "https://pic-link-bot.lovable.app/i/telegram-1779340095109-3b9afb55.jpg",
+  "keywords": [
+    "telegram",
+    "music",
+    "bot",
+    "pyrogram",
+    "py-tgcalls",
+    "voice-chat",
+    "streaming"
+  ],
+  "website": "https://t.me/+OvozYu7R1EczMGJl",
+  "repository": "https://github.com/RajSukh81/MusicLyrics",
+  "stack": "heroku-22",
+  "buildpacks": [
+    {
+      "url": "heroku-community/apt"
+    },
+    {
+      "url": "heroku/nodejs"
+    },
+    {
+      "url": "heroku/python"
+    }
+  ],
+  "env": {
+    "API_ID": {
+      "description": "Telegram API ID — get from https://my.telegram.org/apps",
+      "required": true
+    },
+    "LICENSE_KEY": {
+      "description": "⚠️ REQUIRED — License key to run MusicLyrics. Get your key from @R4J_81 on Telegram. Send your BOT_TOKEN to receive a unique key. Format: ML-XXXXXXXX-XXXXXXXX",
+      "required": true
+    },
+    "API_HASH": {
+      "description": "Telegram API Hash — get from https://my.telegram.org/apps",
+      "required": true
+    },
+    "BOT_TOKEN": {
+      "description": "Bot Token — get from @BotFather on Telegram",
+      "required": true
+    },
+    "STRING_SESSION": {
+      "description": "Pyrogram v2 string session for userbot (needed for voice chat streaming). Generate with: python3 -c \"from pyrogram import Client; Client(':memory:', api_id=API_ID, api_hash='HASH').run(Client.export_session_string)\"",
+      "required": false,
+      "value": ""
+    },
+    "MONGO_URL": {
+      "description": "MongoDB connection URI — get free cluster from https://mongodb.com/atlas",
+      "required": true
+    },
+    "OWNER_ID": {
+      "description": "Your Telegram user ID (numeric). Find via @userinfobot on Telegram",
+      "required": true
+    },
+    "SUDO_USERS": {
+      "description": "Space-separated Telegram user IDs with sudo/admin privileges (e.g. '123456 789012')",
+      "required": false,
+      "value": ""
+    },
+    "LOG_GROUP_ID": {
+      "description": "Telegram group/channel ID for bot event logs (e.g. -1001234567890). Set 0 to disable.",
+      "required": false,
+      "value": "0"
+    },
+    "BOT_USERNAME": {
+      "description": "Your bot's Telegram username (without @). Used for invite links.",
+      "required": false,
+      "value": "MusicLyricsBot"
+    },
+    "SUPPORT_GROUP": {
+      "description": "Support group invite link",
+      "required": false,
+      "value": "https://t.me/+OvozYu7R1EczMGJl"
+    },
+    "SUPPORT_CHANNEL": {
+      "description": "Updates channel link",
+      "required": false,
+      "value": "https://t.me/RupkothaGolpo"
+    },
+    "SPOTIFY_CLIENT_ID": {
+      "description": "Spotify App Client ID (optional — for Spotify track support). Get from https://developer.spotify.com/dashboard",
+      "required": false,
+      "value": ""
+    },
+    "SPOTIFY_CLIENT_SECRET": {
+      "description": "Spotify App Client Secret (optional)",
+      "required": false,
+      "value": ""
+    },
+    "DURATION_LIMIT_MIN": {
+      "description": "Maximum song duration in minutes (default: 60)",
+      "required": false,
+      "value": "60"
+    },
+    "COOKIES_TXT": {
+      "description": "YouTube cookies in Netscape format (paste full content of cookies.txt exported from browser). Prevents 'Sign in to confirm you're not a bot' errors on cloud servers.",
+      "required": false,
+      "value": ""
+    },
+    "YT_PO_TOKEN": {
+      "description": "YouTube PO (Proof of Origin) token for additional bot-detection bypass. Format: web+VISITOR_DATA:PO_TOKEN (optional, advanced).",
+      "required": false,
+      "value": ""
+    },
+    "YT_VISITOR_DATA": {
+      "description": "YouTube visitor data string (used with PO token). Optional, advanced.",
+      "required": false,
+      "value": ""
+    },
+    "AI_API_KEY": {
+      "description": "Google Gemini API key for AI chat features (optional). Get from https://aistudio.google.com/apikey",
+      "required": false,
+      "value": ""
+    },
+    "COBALT_API_KEY": {
+      "description": "Cobalt API key for cloud-friendly YouTube stream extraction (optional). Get from https://cobalt.tools/",
+      "required": false,
+      "value": ""
+    },
+    "YOUTUBE_PROXY": {
+      "description": "Single YouTube proxy URL. Format: http://user:pass@host:port — REQUIRED for cloud platforms (Heroku/Railway/Render) where YouTube blocks server IPs.",
+      "required": false,
+      "value": ""
+    },
+    "YOUTUBE_PROXY_LIST": {
+      "description": "Multiple proxies for rotation (comma-separated). Supports Webshare format (ip:port:user:pass) and standard format (http://user:pass@host:port). RECOMMENDED over single proxy to avoid rate limits.",
+      "required": false,
+      "value": ""
+    }
+  },
+  "formation": {
+    "worker": {
+      "quantity": 1,
+      "size": "eco"
+    }
+  },
+  "addons": []
+}

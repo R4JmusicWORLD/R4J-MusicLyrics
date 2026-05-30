@@ -1,0 +1,62 @@
+# Environment & Secrets
+.env
+*.env
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+*.whl
+pip-wheel-metadata/
+*.manifest
+*.spec
+
+# Virtual environments
+venv/
+.venv/
+env/
+ENV/
+
+# Pyrogram / Telegram sessions
+*.session
+*.session-journal
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+logs/
+
+# Docker
+docker-compose.override.yml
+
+# Misc
+*.bak
+*.tmp
+*.temp
+downloads/
+raw_files/
+
+# License key generator (contains master secret — NEVER push)
+keygen.py
+
+# YouTube cookies (sensitive)
+cookies/*.txt
+!cookies/README.md

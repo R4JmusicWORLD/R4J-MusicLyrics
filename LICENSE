@@ -1,0 +1,89 @@
+R4J_81 PROPRIETARY LICENSE
+Version 1.0 — 2026
+
+Copyright (c) 2026 R4J_81 (https://github.com/RajSukh81)
+All Rights Reserved.
+
+===========================================================================
+
+TERMS AND CONDITIONS
+
+1. DEFINITIONS
+   "Software" refers to the MusicLyrics bot source code, including all
+   files, modules, plugins, configurations, and assets in this repository.
+   "Owner" refers to R4J_81 (GitHub: RajSukh81).
+   "User" refers to any person who accesses, deploys, or interacts with
+   this Software.
+
+2. GRANT OF USE
+   The Owner grants Users a limited, non-exclusive, non-transferable,
+   revocable license to:
+   (a) Deploy and run the Software for personal or community use.
+   (b) Configure the Software (environment variables, support links,
+       bot tokens, etc.) for their own Telegram bot instance.
+
+3. RESTRICTIONS — THE FOLLOWING ARE STRICTLY PROHIBITED:
+   (a) COPYING: Copying, cloning, downloading, or redistributing the
+       source code (in whole or in part) to any other repository,
+       website, platform, or storage medium without prior written
+       permission from the Owner.
+   (b) MODIFICATION: Modifying, altering, adapting, translating, or
+       creating derivative works based on this Software without prior
+       written permission from the Owner.
+   (c) REDISTRIBUTION: Sharing, publishing, uploading, or distributing
+       the source code or any substantial portion thereof in any form
+       (including but not limited to GitHub, GitLab, Bitbucket, file
+       sharing services, or messaging platforms).
+   (d) REVERSE ENGINEERING: Decompiling, disassembling, or reverse
+       engineering the Software.
+   (e) REMOVAL OF ATTRIBUTION: Removing, hiding, or altering any
+       copyright notices, license headers, author credits, or the
+       original repository link from the Software.
+   (f) CLAIMING OWNERSHIP: Representing the Software as your own work
+       or claiming authorship of any part of it.
+
+4. ATTRIBUTION REQUIREMENTS
+   Any deployed instance of this Software MUST:
+   (a) Retain the original author credit "R4J_81" in the bot's /start
+       or /about response.
+   (b) Include a link to the original repository:
+       https://github.com/RajSukh81/MusicLyrics
+   (c) Users may add their own support group/channel links alongside
+       the original credits, but may NOT remove or replace the
+       Owner's credit.
+
+5. SOURCE CODE EXCLUSIVITY
+   The source code of this Software shall only be hosted at the
+   Owner's official repository:
+       https://github.com/RajSukh81/MusicLyrics
+   Any unauthorized copies found elsewhere are in violation of this
+   license.
+
+6. PERMISSION REQUESTS
+   To request permission for copying, modification, or redistribution,
+   contact the Owner at:
+   - GitHub: https://github.com/RajSukh81
+   - Telegram: @Raj_81
+
+7. TERMINATION
+   This license is automatically terminated if the User violates any
+   of the above terms. Upon termination, the User must immediately
+   cease all use of the Software and destroy any copies in their
+   possession.
+
+8. DISCLAIMER OF WARRANTY
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+   EXPRESS OR IMPLIED. THE OWNER SHALL NOT BE LIABLE FOR ANY CLAIM,
+   DAMAGES, OR OTHER LIABILITY ARISING FROM THE USE OF THE SOFTWARE.
+
+9. ENFORCEMENT
+   The Owner reserves the right to take legal action against any
+   individual or entity that violates the terms of this license,
+   including but not limited to filing DMCA takedown requests.
+
+===========================================================================
+
+By using, deploying, or accessing this Software, you agree to be
+bound by the terms of this license.
+
+(c) 2026 R4J_81 — All Rights Reserved.

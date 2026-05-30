@@ -1,0 +1,26 @@
+version: "3.8"
+
+services:
+  mongo:
+    image: mongo:7
+    container_name: musiclyrics-mongo
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+
+  musiclyrics:
+    build: .
+    container_name: musiclyrics-bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      - MONGO_URL=mongodb://mongo:27017/musiclyrics
+      - LICENSE_KEY=${LICENSE_KEY}
+    volumes:
+      - ./downloads:/app/downloads
+    depends_on:
+      - mongo
+
+volumes:
+  mongo_data:

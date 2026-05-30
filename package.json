@@ -1,0 +1,9 @@
+{
+  "name": "musiclyrics-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Node.js runtime for yt-dlp YouTube extraction",
+  "engines": {
+    "node": "18.x"
+  }
+}

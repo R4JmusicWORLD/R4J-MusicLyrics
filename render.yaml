@@ -1,0 +1,51 @@
+services:
+  - type: worker
+    name: musiclyrics
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python3 -m MusicLyrics
+    envVars:
+      - key: LICENSE_KEY
+        sync: false
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: BOT_TOKEN
+        sync: false
+      - key: STRING_SESSION
+        sync: false
+      - key: MONGO_URL
+        sync: false
+      - key: OWNER_ID
+        sync: false
+      - key: SUDO_USERS
+        sync: false
+      - key: LOG_GROUP_ID
+        sync: false
+      - key: BOT_USERNAME
+        sync: false
+      - key: SUPPORT_GROUP
+        sync: false
+      - key: SUPPORT_CHANNEL
+        sync: false
+      - key: SPOTIFY_CLIENT_ID
+        sync: false
+      - key: SPOTIFY_CLIENT_SECRET
+        sync: false
+      - key: DURATION_LIMIT_MIN
+        sync: false
+      - key: COOKIES_TXT
+        sync: false
+      - key: YT_PO_TOKEN
+        sync: false
+      - key: YT_VISITOR_DATA
+        sync: false
+      - key: AI_API_KEY
+        sync: false
+      - key: COBALT_API_KEY
+        sync: false
+      - key: YOUTUBE_PROXY
+        sync: false
+      - key: YOUTUBE_PROXY_LIST
+        sync: false
