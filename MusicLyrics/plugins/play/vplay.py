@@ -83,7 +83,7 @@ async def _get_video_media(url: str) -> tuple[str, bool]:
 
     Returns (media_path, is_stream_url).
     SPEED OPTIMISED: Stream URL first (instant playback, no download wait),
-    download only as fallback when stream URLs fail.
+    download + SoundCloud run concurrently as fallback.
     """
     # Try 1: Get direct stream URL FIRST (fastest — instant playback)
     LOG.info("Getting video stream URL for: %s", url)
@@ -92,31 +92,60 @@ async def _get_video_media(url: str) -> tuple[str, bool]:
         LOG.info("Using video stream URL for: %s", url)
         return stream_url, True
 
-    # Try 2: Download to disk (fallback)
-    LOG.info("Video stream URL failed, downloading for: %s", url)
-    filepath = await download_video(url)
-    if filepath and os.path.isfile(filepath):
-        return filepath, False
+    # Try 2: Download + SoundCloud CONCURRENTLY
+    LOG.info("Video stream URL failed, trying download + SoundCloud concurrently for: %s", url)
 
-    # Try 3: Combined search+download (bypasses URL-specific issues)
     from MusicLyrics.plugins.play.platforms.youtube import get_video_info
     info = await get_video_info(url)
     title = info.get("title", "") if info else ""
-    if title and title not in ("YouTube Video", "Unknown"):
-        LOG.info("Video URL extraction failed, trying search+download with title: %s", title)
-        filepath_sd, _ = await search_and_download_video(title)
-        if filepath_sd and os.path.isfile(filepath_sd):
-            return filepath_sd, False
 
-    # Try 4: SoundCloud as LAST RESORT fallback
-    if title and title not in ("YouTube Video", "Unknown"):
-        LOG.info("All video methods failed, trying SoundCloud fallback for: %s", title)
-        sc_path, sc_info = await search_and_download_soundcloud(title)
-        if sc_path:
-            if sc_info and sc_info.get("_is_stream_url"):
-                return sc_path, True
-            if os.path.isfile(sc_path):
-                return sc_path, False
+    async def _try_download():
+        try:
+            filepath = await download_video(url)
+            if filepath and os.path.isfile(filepath):
+                return filepath, False
+        except Exception:
+            pass
+        if title and title not in ("YouTube Video", "Unknown"):
+            try:
+                filepath_sd, _ = await search_and_download_video(title)
+                if filepath_sd and os.path.isfile(filepath_sd):
+                    return filepath_sd, False
+            except Exception:
+                pass
+        return None
+
+    async def _try_soundcloud():
+        if not title or title in ("YouTube Video", "Unknown"):
+            return None
+        try:
+            sc_path, sc_info = await search_and_download_soundcloud(title)
+            if sc_path:
+                if sc_info and sc_info.get("_is_stream_url"):
+                    return sc_path, True
+                if os.path.isfile(sc_path):
+                    return sc_path, False
+        except Exception:
+            pass
+        return None
+
+    import asyncio as _aio
+    tasks = [
+        _aio.create_task(_try_download()),
+        _aio.create_task(_try_soundcloud()),
+    ]
+    pending = set(tasks)
+    while pending:
+        done, pending = await _aio.wait(pending, return_when=_aio.FIRST_COMPLETED)
+        for task in done:
+            try:
+                result = task.result()
+                if result:
+                    for p in pending:
+                        p.cancel()
+                    return result
+            except Exception:
+                pass
 
     return "", False
 

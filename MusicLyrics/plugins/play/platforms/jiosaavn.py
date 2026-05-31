@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from typing import Optional, Tuple
@@ -11,7 +12,14 @@ import aiohttp
 LOG = logging.getLogger(__name__)
 
 _API_BASE = "https://saavn.dev/api"
-_API_FALLBACK = "https://jiosaavn-api-privatecvc2.vercel.app"
+# Multiple fallback endpoints for reliability
+_API_FALLBACKS = [
+    "https://jiosaavn-api-privatecvc2.vercel.app",
+    "https://saavn.dev/api",
+    "https://jio-savaan-private.vercel.app",
+    "https://jiosaavn-api-ts.vercel.app",
+]
+_API_FALLBACK = _API_FALLBACKS[0]
 
 
 def is_jiosaavn_url(url: str) -> bool:
@@ -28,7 +36,7 @@ async def _search_songs_from_base(session: aiohttp.ClientSession, base: str, que
         async with session.get(
             f"{base}/api/search/songs" if "privatecvc2" in base else f"{base}/search/songs",
             params={"query": query, "limit": 1},
-            timeout=aiohttp.ClientTimeout(total=10),
+            timeout=aiohttp.ClientTimeout(total=6),
         ) as resp:
             if resp.status != 200:
                 return None
@@ -48,7 +56,7 @@ async def _fetch_song_from_base(session: aiohttp.ClientSession, base: str, url: 
         async with session.get(
             endpoint,
             params={"link": url},
-            timeout=aiohttp.ClientTimeout(total=10),
+            timeout=aiohttp.ClientTimeout(total=6),
         ) as resp:
             if resp.status != 200:
                 return None
@@ -68,24 +76,37 @@ async def _fetch_song_from_base(session: aiohttp.ClientSession, base: str, url: 
 async def search_jiosaavn(query: str) -> Optional[dict]:
     """Search JioSaavn; return first result or None.
 
-    Tries the primary API base (saavn.dev) first, then falls back to the
-    alternate endpoint if the primary is unavailable or returns no results.
+    Tries the primary API base (saavn.dev) first, then falls back to
+    ALL alternate endpoints CONCURRENTLY for speed and reliability.
 
     Keys: title, url, duration (sec), thumbnail, artist, download_url.
     """
     try:
         async with aiohttp.ClientSession() as session:
-            # Primary endpoint
+            # Primary endpoint first (fastest)
             result = await _search_songs_from_base(session, _API_BASE, query)
             if result:
                 return result
 
-            LOG.warning("JioSaavn primary API returned no results for %r; trying fallback.", query)
+            LOG.warning("JioSaavn primary API returned no results for %r; trying fallbacks concurrently.", query)
 
-            # Fallback endpoint
-            result = await _search_songs_from_base(session, _API_FALLBACK, query)
-            if result:
-                return result
+            # Try ALL fallbacks concurrently — first result wins
+            tasks = [
+                asyncio.create_task(_search_songs_from_base(session, base, query))
+                for base in _API_FALLBACKS
+            ]
+            pending = set(tasks)
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    try:
+                        res = task.result()
+                        if res:
+                            for p in pending:
+                                p.cancel()
+                            return res
+                    except Exception:
+                        pass
 
         LOG.warning("JioSaavn: no results found on any endpoint for %r", query)
         return None
@@ -97,7 +118,7 @@ async def search_jiosaavn(query: str) -> Optional[dict]:
 async def get_jiosaavn_song(url: str) -> Optional[dict]:
     """Get song details and direct download URL from a JioSaavn link.
 
-    Tries the primary API base first, then falls back to the alternate endpoint.
+    Tries the primary API base first, then ALL fallback endpoints concurrently.
     """
     try:
         async with aiohttp.ClientSession() as session:
@@ -105,11 +126,25 @@ async def get_jiosaavn_song(url: str) -> Optional[dict]:
             if result:
                 return result
 
-            LOG.warning("JioSaavn primary API failed for URL %r; trying fallback.", url)
+            LOG.warning("JioSaavn primary API failed for URL %r; trying fallbacks concurrently.", url)
 
-            result = await _fetch_song_from_base(session, _API_FALLBACK, url)
-            if result:
-                return result
+            # Try ALL fallbacks concurrently
+            tasks = [
+                asyncio.create_task(_fetch_song_from_base(session, base, url))
+                for base in _API_FALLBACKS
+            ]
+            pending = set(tasks)
+            while pending:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    try:
+                        res = task.result()
+                        if res:
+                            for p in pending:
+                                p.cancel()
+                            return res
+                    except Exception:
+                        pass
 
         LOG.warning("JioSaavn: could not fetch song for URL %r on any endpoint.", url)
         return None

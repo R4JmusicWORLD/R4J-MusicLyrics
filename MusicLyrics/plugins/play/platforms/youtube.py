@@ -61,13 +61,17 @@ _PIPED_INSTANCES = [
     "https://pipedapi.moomoo.me",
     "https://pipedapi.darkness.services",
     "https://api.piped.private.coffee",
+    "https://pipedapi.hostux.net",
+    "https://pipedapi.ngn.tf",
+    "https://watchapi.whatever.social",
+    "https://pipedapi.smnz.de",
 ]
 
 # Track dead Piped/Invidious instances at runtime to skip them
 # Each entry is (instance_url, timestamp_when_marked_dead)
 _dead_piped: dict[str, float] = {}
 _dead_invidious: dict[str, float] = {}
-_DEAD_INSTANCE_RECOVERY_SECONDS = 300  # Re-try dead instances after 5 minutes
+_DEAD_INSTANCE_RECOVERY_SECONDS = 120  # Re-try dead instances after 2 minutes
 
 # Invidious instances as additional fallback (updated May 2026)
 # These act as YouTube proxies — no cookies needed
@@ -86,6 +90,9 @@ _INVIDIOUS_INSTANCES = [
     "https://invidious.darkness.services",
     "https://inv.in.projectsegfau.lt",
     "https://invidious.private.coffee",
+    "https://invidious.protokolla.fi",
+    "https://iv.melmac.space",
+    "https://invidious.io.lol",
 ]
 
 # Cobalt API — reliable cloud-friendly YouTube proxy
@@ -96,6 +103,8 @@ _COBALT_INSTANCES = [
     "https://cobalt.canine.tools",
     "https://cobalt-api.ayo.tf",
     "https://co.eepy.today",
+    "https://cobalt-api.hyper.lol",
+    "https://cobalt.tskau.team",
 ]
 # Allow custom Cobalt instance via env var (e.g., self-hosted)
 _cobalt_custom_url = os.environ.get("COBALT_API_URL", "").strip().rstrip("/")
@@ -240,8 +249,8 @@ async def _piped_get_streams(video_id: str) -> Optional[dict]:
     instances = list(_PIPED_INSTANCES)
     random.shuffle(instances)
 
-    # Try instances in batches of 7 concurrently for speed
-    batch_size = 7
+    # Try instances in batches of 10 concurrently for speed
+    batch_size = 10
     for i in range(0, len(instances), batch_size):
         batch = instances[i:i + batch_size]
         tasks = [_try_piped_instance(base_url, video_id) for base_url in batch]
@@ -268,7 +277,7 @@ async def _try_piped_instance(base_url: str, video_id: str) -> Optional[dict]:
             async with session.get(
                 f"{base_url}/streams/{video_id}",
                 headers=_PROXY_HEADERS,
-                timeout=aiohttp.ClientTimeout(total=5),
+                timeout=aiohttp.ClientTimeout(total=4),
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -297,8 +306,8 @@ async def _invidious_get_streams(video_id: str) -> Optional[dict]:
     instances = list(_INVIDIOUS_INSTANCES)
     random.shuffle(instances)
 
-    # Try instances in batches of 7 concurrently
-    batch_size = 7
+    # Try instances in batches of 10 concurrently
+    batch_size = 10
     for i in range(0, len(instances), batch_size):
         batch = instances[i:i + batch_size]
         tasks = [_try_invidious_instance(base_url, video_id) for base_url in batch]
@@ -325,7 +334,7 @@ async def _try_invidious_instance(base_url: str, video_id: str) -> Optional[dict
             async with session.get(
                 f"{base_url}/api/v1/videos/{video_id}",
                 headers=_PROXY_HEADERS,
-                timeout=aiohttp.ClientTimeout(total=5),
+                timeout=aiohttp.ClientTimeout(total=4),
             ) as resp:
                 if resp.status == 200:
                     data = await resp.json()
@@ -449,7 +458,7 @@ async def _cobalt_get_stream(video_id: str, audio_only: bool = True) -> Optional
                             f"{instance}{endpoint}",
                             json=payload,
                             headers=headers,
-                            timeout=aiohttp.ClientTimeout(total=8),
+                            timeout=aiohttp.ClientTimeout(total=6),
                         ) as resp:
                             if resp.status == 200:
                                 data = await resp.json()
@@ -778,7 +787,7 @@ async def _innertube_web_with_cookies(video_id: str, cookie_file: str) -> Option
                 api_url,
                 json=payload,
                 headers=headers,
-                timeout=aiohttp.ClientTimeout(total=8),
+                timeout=aiohttp.ClientTimeout(total=6),
                 **_aio_request_kwargs(),
             ) as resp:
                 if resp.status != 200:
@@ -880,7 +889,7 @@ async def _innertube_player(video_id: str) -> Optional[dict]:
                     api_url,
                     json=payload,
                     headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=6),
+                    timeout=aiohttp.ClientTimeout(total=5),
                     **req_kwargs,
                 ) as resp:
                     if resp.status != 200:
@@ -1143,9 +1152,9 @@ def _base_ytdlp_opts(client_combo: Optional[list[str]] = None) -> dict:
         "geo_bypass": True,
         "geo_bypass_country": "US",
         "nocheckcertificate": True,
-        "socket_timeout": 15,
-        "retries": 3,
-        "fragment_retries": 3,
+        "socket_timeout": 10,
+        "retries": 2,
+        "fragment_retries": 2,
         "noplaylist": True,
         "no_color": True,
         "noprogress": True,
@@ -1308,7 +1317,7 @@ async def _innertube_search(query: str, limit: int = 5) -> list[dict]:
             _INNERTUBE_SEARCH_URL,
             json=payload,
             headers=_HEADERS,
-            timeout=aiohttp.ClientTimeout(total=8),
+            timeout=aiohttp.ClientTimeout(total=6),
         ) as resp:
             if resp.status != 200:
                 LOG.warning("Innertube search HTTP %d for: %s", resp.status, query)

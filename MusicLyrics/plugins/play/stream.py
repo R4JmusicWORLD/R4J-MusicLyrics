@@ -374,7 +374,7 @@ async def _check_stream_url(url: str) -> bool:
     """Quick HEAD check to see if a stream URL is still valid.
 
     Returns True if URL is reachable (2xx/3xx), False otherwise.
-    SPEED OPTIMISED: 2s timeout, HEAD-only, assume OK on timeout.
+    SPEED OPTIMISED: 1.5s timeout, HEAD-only, assume OK on timeout.
     """
     if not _is_url(url):
         return True  # Not a URL, skip check
@@ -384,7 +384,7 @@ async def _check_stream_url(url: str) -> bool:
             try:
                 async with session.head(
                     url,
-                    timeout=aiohttp.ClientTimeout(total=1.5, connect=1),
+                    timeout=aiohttp.ClientTimeout(total=1.2, connect=0.8),
                     allow_redirects=True,
                 ) as resp:
                     if resp.status < 400:
@@ -404,8 +404,11 @@ async def _check_stream_url(url: str) -> bool:
 
 def _validate_media(media_path: str) -> None:
     """Validate media path -- file must exist or be a URL."""
-    if not media_path:
+    if not media_path or not isinstance(media_path, str):
         raise FileNotFoundError("No media path provided.")
+    media_path = media_path.strip()
+    if not media_path:
+        raise FileNotFoundError("Empty media path provided.")
     if _is_url(media_path):
         # Basic URL sanity checks
         if len(media_path) < 10:
@@ -1128,10 +1131,10 @@ def is_active(chat_id: int) -> bool:
 # -- Fresh resolve helper used by skip and auto-next --
 
 async def _fresh_resolve_and_play(chat_id: int, item) -> bool:
-    """Try YouTube FIRST for correct results, then fallback to others.
+    """Try ALL platforms CONCURRENTLY for fastest results.
 
-    YouTube gives the most accurate song match, so we try it first and
-    only fall back to JioSaavn/SoundCloud concurrently if YouTube fails.
+    YouTube, JioSaavn, and SoundCloud all run at the same time.
+    First successful result wins — no waiting for sequential failures.
 
     Returns True on success, False on failure.  Caller is responsible for
     sending UI messages (Now Playing / error).
@@ -1141,29 +1144,27 @@ async def _fresh_resolve_and_play(chat_id: int, item) -> bool:
     fresh_path = None
     fresh_is_stream = False
 
-    # ── Step 1: Try YouTube first (most accurate match) ──────────────
-    try:
-        from MusicLyrics.plugins.play.platforms.youtube import (
-            get_audio_stream_url, get_video_stream_url,
-            is_youtube_url, search_and_download_audio as yt_search_dl,
-            search_and_download_video as yt_search_dl_video,
-            search_youtube as _yt_search,
-        )
+    # ── Run ALL platforms concurrently ──────────────────────────
+    async def _try_youtube():
+        """Try YouTube: stream URL first, then download."""
+        try:
+            from MusicLyrics.plugins.play.platforms.youtube import (
+                get_audio_stream_url, get_video_stream_url,
+                is_youtube_url, search_and_download_audio as yt_search_dl,
+                search_and_download_video as yt_search_dl_video,
+                search_youtube as _yt_search,
+            )
 
-        LOG.info("fresh_resolve: trying YouTube FIRST for %s: '%s'", chat_id, item.title)
+            # Try re-fetch stream URL if we have the original YouTube URL
+            if is_youtube_url(item.url):
+                if item.stream_type == "video":
+                    new_url = await get_video_stream_url(item.url)
+                else:
+                    new_url = await get_audio_stream_url(item.url)
+                if new_url:
+                    return new_url, True, "youtube"
 
-        # Try re-fetch stream URL if we have the original YouTube URL
-        if is_youtube_url(item.url):
-            if item.stream_type == "video":
-                new_url = await get_video_stream_url(item.url)
-            else:
-                new_url = await get_audio_stream_url(item.url)
-            if new_url:
-                fresh_path = new_url
-                fresh_is_stream = True
-
-        # Try search by title → get stream URL (faster than download)
-        if not fresh_path:
+            # Try search by title → get stream URL (faster than download)
             yt_result = await _yt_search(item.title)
             if yt_result and yt_result.get("url"):
                 if item.stream_type == "video":
@@ -1171,78 +1172,74 @@ async def _fresh_resolve_and_play(chat_id: int, item) -> bool:
                 else:
                     new_url = await get_audio_stream_url(yt_result["url"])
                 if new_url:
-                    fresh_path = new_url
-                    fresh_is_stream = True
+                    return new_url, True, "youtube"
 
-        # Try search+download by title (local file)
-        if not fresh_path:
+            # Try search+download by title (local file)
             if item.stream_type == "video":
                 path, info = await yt_search_dl_video(item.title)
             else:
                 path, info = await yt_search_dl(item.title)
             if path and _os.path.isfile(str(path)):
-                fresh_path = path
-                fresh_is_stream = False
+                return path, False, "youtube"
+        except Exception as e:
+            LOG.debug("fresh_resolve: YouTube failed for '%s': %s", item.title, e)
+        return None, False, ""
 
-        if fresh_path:
-            _last_successful_platform[chat_id] = "youtube"
-            LOG.info("fresh_resolve: YouTube succeeded for '%s'", item.title)
-    except Exception as e:
-        LOG.debug("fresh_resolve: YouTube failed for '%s': %s", item.title, e)
+    async def _try_jiosaavn():
+        """Try JioSaavn: stream URL first, then download."""
+        try:
+            from MusicLyrics.plugins.play.platforms.jiosaavn import search_jiosaavn as _js_search
+            js_result = await _js_search(item.title)
+            if js_result and js_result.get("download_url"):
+                return js_result["download_url"], True, "jiosaavn"
+        except Exception:
+            pass
+        try:
+            js_path, js_info = await search_and_download_jiosaavn(item.title)
+            if js_path and _os.path.isfile(str(js_path)):
+                return js_path, False, "jiosaavn"
+        except Exception:
+            pass
+        return None, False, ""
 
-    # ── Step 2: If YouTube failed, try JioSaavn + SoundCloud concurrently ─
-    if not fresh_path:
-        LOG.info("fresh_resolve: YouTube failed, trying JioSaavn+SoundCloud for '%s'", item.title)
+    async def _try_soundcloud():
+        """Try SoundCloud."""
+        try:
+            sc_path, sc_info = await search_and_download_soundcloud(item.title)
+            if sc_path:
+                if sc_info and sc_info.get("_is_stream_url"):
+                    return sc_path, True, "soundcloud"
+                if _os.path.isfile(str(sc_path)):
+                    return sc_path, False, "soundcloud"
+        except Exception:
+            pass
+        return None, False, ""
 
-        async def _try_jiosaavn(title):
+    LOG.info("fresh_resolve: trying ALL platforms concurrently for %s: '%s'", chat_id, item.title)
+
+    tasks = {
+        asyncio.create_task(_try_youtube()): "youtube",
+        asyncio.create_task(_try_jiosaavn()): "jiosaavn",
+        asyncio.create_task(_try_soundcloud()): "soundcloud",
+    }
+
+    pending = set(tasks.keys())
+    while pending:
+        done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
             try:
-                # Try stream URL first (faster — no download needed)
-                from MusicLyrics.plugins.play.platforms.jiosaavn import search_jiosaavn as _js_search
-                js_result = await _js_search(title)
-                if js_result and js_result.get("download_url"):
-                    return js_result["download_url"], True
+                result_path, result_stream, platform = task.result()
+                if result_path:
+                    fresh_path = result_path
+                    fresh_is_stream = result_stream
+                    _last_successful_platform[chat_id] = platform
+                    LOG.info("fresh_resolve: %s succeeded for '%s'", platform, item.title)
+                    for p in pending:
+                        p.cancel()
+                    pending = set()
+                    break
             except Exception:
                 pass
-            try:
-                js_path, js_info = await search_and_download_jiosaavn(title)
-                if js_path and _os.path.isfile(str(js_path)):
-                    return js_path, False
-            except Exception:
-                pass
-            return None, False
-
-        async def _try_soundcloud(title):
-            try:
-                sc_path, sc_info = await search_and_download_soundcloud(title)
-                if sc_path:
-                    if sc_info and sc_info.get("_is_stream_url"):
-                        return sc_path, True
-                    if _os.path.isfile(str(sc_path)):
-                        return sc_path, False
-            except Exception:
-                pass
-            return None, False
-
-        sc_task = asyncio.create_task(_try_soundcloud(item.title))
-        js_task = asyncio.create_task(_try_jiosaavn(item.title))
-
-        pending = {sc_task, js_task}
-        platform_map = {id(sc_task): "soundcloud", id(js_task): "jiosaavn"}
-        while pending:
-            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                try:
-                    result_path, result_stream = task.result()
-                    if result_path:
-                        fresh_path = result_path
-                        fresh_is_stream = result_stream
-                        _last_successful_platform[chat_id] = platform_map.get(id(task), "")
-                        for p in pending:
-                            p.cancel()
-                        pending = set()
-                        break
-                except Exception:
-                    pass
 
     if not fresh_path:
         LOG.error("All platforms failed for fresh_resolve_and_play: %s", item.title)
@@ -1265,21 +1262,25 @@ async def _on_stream_end(client, update):
     """When current track ends, play next in queue or leave."""
     chat_id = None
 
-    # Try various ways to get chat_id from the update object
-    if hasattr(update, "chat_id"):
-        chat_id = update.chat_id
-    elif hasattr(update, "chat"):
-        chat_obj = update.chat
-        if isinstance(chat_obj, dict):
-            chat_id = chat_obj.get("id")
-        elif isinstance(chat_obj, int):
-            chat_id = chat_obj
-        elif hasattr(chat_obj, "id"):
-            chat_id = chat_obj.id
-    elif isinstance(update, int):
-        chat_id = update
-    elif isinstance(update, dict):
-        chat_id = update.get("chat_id") or update.get("chat", {}).get("id")
+    try:
+        # Try various ways to get chat_id from the update object
+        if hasattr(update, "chat_id"):
+            chat_id = update.chat_id
+        elif hasattr(update, "chat"):
+            chat_obj = update.chat
+            if isinstance(chat_obj, dict):
+                chat_id = chat_obj.get("id")
+            elif isinstance(chat_obj, int):
+                chat_id = chat_obj
+            elif hasattr(chat_obj, "id"):
+                chat_id = chat_obj.id
+        elif isinstance(update, int):
+            chat_id = update
+        elif isinstance(update, dict):
+            chat_id = update.get("chat_id") or update.get("chat", {}).get("id")
+    except Exception as e:
+        LOG.warning("Error extracting chat_id from stream end event: %s", e)
+        return
 
     if chat_id is None:
         LOG.warning("Stream end event with unknown chat_id: %s (type: %s)", update, type(update).__name__)
@@ -1482,11 +1483,14 @@ if pytgcalls is not None:
             @pytgcalls.on_update()
             async def _raw_update_handler(client, update):
                 # Only handle stream-end type events
-                update_type = type(update).__name__.lower()
-                if update_type in ("streamaudioended", "streamvideoended", "streamended", "stream_end"):
-                    await _on_stream_end(client, update)
-                elif "end" in update_type and ("stream" in update_type or "audio" in update_type):
-                    await _on_stream_end(client, update)
+                try:
+                    update_type = type(update).__name__.lower()
+                    if update_type in ("streamaudioended", "streamvideoended", "streamended", "stream_end"):
+                        await _on_stream_end(client, update)
+                    elif "end" in update_type and ("stream" in update_type or "audio" in update_type):
+                        await _on_stream_end(client, update)
+                except Exception as e:
+                    LOG.exception("Error in raw_update_handler: %s", e)
             _registered = True
             LOG.info("Stream-end callback registered via raw pytgcalls.on_update()")
         except (AttributeError, TypeError) as e:

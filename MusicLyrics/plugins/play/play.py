@@ -108,6 +108,7 @@ async def _get_audio_media(url: str) -> tuple[str, bool]:
     Returns (media_path, is_stream_url).
     SPEED OPTIMISED: Stream URL first (instant playback, no download wait),
     download only as fallback when stream URLs fail.
+    JioSaavn + SoundCloud run concurrently with download for faster fallback.
     """
     # Try 1: Get direct stream URL FIRST (fastest — no download needed,
     # playback starts instantly. Cobalt/Innertube/Piped run concurrently.)
@@ -117,42 +118,75 @@ async def _get_audio_media(url: str) -> tuple[str, bool]:
         LOG.info("Using stream URL for: %s", url)
         return stream_url, True
 
-    # Try 2: Download to disk (fallback when stream URLs fail)
-    LOG.info("Stream URL failed, downloading audio for: %s", url)
-    filepath = await download_audio(url)
-    if filepath and os.path.isfile(filepath):
-        LOG.info("Downloaded audio for: %s -> %s", url, filepath)
-        return filepath, False
+    # Try 2: Download + JioSaavn + SoundCloud ALL CONCURRENTLY
+    # Whichever succeeds first wins
+    LOG.info("Stream URL failed, trying download + JioSaavn + SoundCloud concurrently for: %s", url)
 
-    # Try 3: Combined search+download (bypasses URL-specific issues)
+    # Get title for fallback searches
     from MusicLyrics.plugins.play.platforms.youtube import get_video_info
     info = await get_video_info(url)
     title = info.get("title", "") if info else ""
-    if title and title not in ("YouTube Audio", "Unknown"):
-        LOG.info("URL extraction failed, trying search+download with title: %s", title)
-        filepath_sd, _ = await search_and_download_audio(title)
-        if filepath_sd and os.path.isfile(filepath_sd):
-            return filepath_sd, False
 
-    # Try 4: JioSaavn as fallback before SoundCloud
-    if title and title not in ("YouTube Audio", "Unknown"):
-        LOG.info("YouTube methods failed, trying JioSaavn for: %s", title)
+    async def _try_download():
+        try:
+            filepath = await download_audio(url)
+            if filepath and os.path.isfile(filepath):
+                return filepath, False
+        except Exception:
+            pass
+        # Try combined search+download with title
+        if title and title not in ("YouTube Audio", "Unknown"):
+            try:
+                filepath_sd, _ = await search_and_download_audio(title)
+                if filepath_sd and os.path.isfile(filepath_sd):
+                    return filepath_sd, False
+            except Exception:
+                pass
+        return None
+
+    async def _try_jiosaavn():
+        if not title or title in ("YouTube Audio", "Unknown"):
+            return None
         try:
             js_path, js_info = await search_and_download_jiosaavn(title)
             if js_path and os.path.isfile(js_path):
                 return js_path, False
         except Exception:
-            LOG.debug("JioSaavn fallback failed for: %s", title)
+            pass
+        return None
 
-    # Try 5: SoundCloud as LAST RESORT fallback
-    if title and title not in ("YouTube Audio", "Unknown"):
-        LOG.info("All YouTube methods failed, trying SoundCloud fallback for: %s", title)
-        sc_path, sc_info = await search_and_download_soundcloud(title)
-        if sc_path:
-            if sc_info and sc_info.get("_is_stream_url"):
-                return sc_path, True
-            if os.path.isfile(sc_path):
-                return sc_path, False
+    async def _try_soundcloud():
+        if not title or title in ("YouTube Audio", "Unknown"):
+            return None
+        try:
+            sc_path, sc_info = await search_and_download_soundcloud(title)
+            if sc_path:
+                if sc_info and sc_info.get("_is_stream_url"):
+                    return sc_path, True
+                if os.path.isfile(sc_path):
+                    return sc_path, False
+        except Exception:
+            pass
+        return None
+
+    import asyncio as _aio
+    tasks = [
+        _aio.create_task(_try_download()),
+        _aio.create_task(_try_jiosaavn()),
+        _aio.create_task(_try_soundcloud()),
+    ]
+    pending = set(tasks)
+    while pending:
+        done, pending = await _aio.wait(pending, return_when=_aio.FIRST_COMPLETED)
+        for task in done:
+            try:
+                result = task.result()
+                if result:
+                    for p in pending:
+                        p.cancel()
+                    return result
+            except Exception:
+                pass
 
     return "", False
 
@@ -378,12 +412,13 @@ async def _resolve_query(query: str, platform: str, msg: Message):
     # SPEED OPTIMISED: Search YouTube + get stream URL + JioSaavn
     # ALL CONCURRENTLY.  Stream URLs give instant playback (no download).
     # Download only as last resort fallback.
+    # ALSO: SoundCloud runs concurrently with YouTube/JioSaavn for faster fallback.
 
     import asyncio as _aio
 
-    LOG.info("Query search: trying YouTube + JioSaavn CONCURRENTLY for: %s", query)
+    LOG.info("Query search: trying YouTube + JioSaavn + SoundCloud CONCURRENTLY for: %s", query)
 
-    # ── Step 1: Search + stream URL across platforms concurrently ──
+    # ── Step 1: Search + stream URL across ALL platforms concurrently ──
     async def _yt_search_and_stream():
         """Search YouTube and get stream URL (fastest — no download wait)."""
         try:
@@ -395,6 +430,10 @@ async def _resolve_query(query: str, platform: str, msg: Message):
             stream_url = await get_audio_stream_url(yt["url"])
             if stream_url:
                 return yt, stream_url, True
+            # If stream URL failed, try download immediately
+            filepath, dl_info = await search_and_download_audio(query)
+            if filepath and os.path.isfile(filepath):
+                return (dl_info or yt), filepath, False
         except Exception:
             pass
         return None
@@ -433,9 +472,22 @@ async def _resolve_query(query: str, platform: str, msg: Message):
             pass
         return None
 
+    async def _soundcloud_search():
+        """Search SoundCloud concurrently (ultimate fallback)."""
+        try:
+            sc_path, sc_info = await search_and_download_soundcloud(query)
+            if sc_path and sc_info:
+                is_stream = bool(sc_info.get("_is_stream_url"))
+                if is_stream or os.path.isfile(str(sc_path)):
+                    return sc_info, sc_path, is_stream
+        except Exception:
+            pass
+        return None
+
     stream_tasks = [
         _aio.create_task(_yt_search_and_stream()),
         _aio.create_task(_jiosaavn_search_and_stream()),
+        _aio.create_task(_soundcloud_search()),
     ]
 
     pending = set(stream_tasks)
@@ -450,26 +502,6 @@ async def _resolve_query(query: str, platform: str, msg: Message):
                     return result
             except Exception:
                 pass
-
-    # ── Step 2: Stream URLs failed — try yt-dlp search+download as fallback ──
-    LOG.info("Stream URLs failed, trying yt-dlp download for: %s", query)
-    try:
-        filepath, dl_info = await search_and_download_audio(query)
-        if filepath and dl_info:
-            return dl_info, filepath, False
-    except Exception:
-        pass
-
-    # ── Step 3: SoundCloud as last resort ──
-    LOG.info("All failed, trying SoundCloud for: %s", query)
-    try:
-        sc_path, sc_info = await search_and_download_soundcloud(query)
-        if sc_path and sc_info:
-            is_stream = bool(sc_info.get("_is_stream_url"))
-            if is_stream or os.path.isfile(str(sc_path)):
-                return sc_info, sc_path, is_stream
-    except Exception:
-        pass
 
     raise ValueError("কোনো result পাওয়া যায়নি। অন্য keyword দিয়ে চেষ্টা করুন।")
 
