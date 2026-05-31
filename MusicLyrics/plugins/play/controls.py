@@ -129,8 +129,30 @@ async def skip_cmd(client: Client, message: Message):
 
             # Fresh-resolve media across platforms (YouTube first)
             success = await _fresh_resolve_and_play(chat_id, next_item)
+
+            # If this track failed, try up to 3 subsequent tracks
             if not success:
-                reply = await message.reply_text("❌ পরের গানে যেতে সমস্যা হয়েছে।")
+                retries = 0
+                while retries < 3:
+                    retries += 1
+                    fallback_item = await skip_queue(chat_id, force=True)
+                    if fallback_item is None:
+                        break
+                    suppress_next_stream_end(chat_id)
+                    try:
+                        success = await _fresh_resolve_and_play(chat_id, fallback_item)
+                        if success:
+                            next_item = fallback_item
+                            break
+                    except Exception:
+                        continue
+
+            if not success:
+                await leave_voice_chat(chat_id)
+                reply = await message.reply_text(
+                    "❌ পরের গানগুলোতে যেতে সমস্যা হয়েছে।\n"
+                    "Voice chat থেকে বের হচ্ছি।"
+                )
                 await _add_reaction(chat_id, message.id)
                 return
 
@@ -422,11 +444,33 @@ async def cb_skip(client: Client, callback: CallbackQuery):
 
             # Fresh-resolve media across platforms (YouTube first)
             success = await _fresh_resolve_and_play(chat_id, next_item)
+
+            # If this track failed, try up to 3 subsequent tracks
+            if not success:
+                retries = 0
+                while retries < 3:
+                    retries += 1
+                    fallback_item = await skip_queue(chat_id, force=True)
+                    if fallback_item is None:
+                        break
+                    suppress_next_stream_end(chat_id)
+                    try:
+                        success = await _fresh_resolve_and_play(chat_id, fallback_item)
+                        if success:
+                            next_item = fallback_item
+                            break
+                    except Exception:
+                        continue
+
             if not success:
                 try:
-                    err_reply = await callback.message.reply_text("❌ Skip করা যায়নি। আবার চেষ্টা করুন।")
+                    err_reply = await callback.message.reply_text(
+                        "❌ Skip করা যায়নি — গানগুলো চলানো সম্ভব হচ্ছে না।\n"
+                        "Voice chat থেকে বের হচ্ছি।"
+                    )
                 except Exception:
                     pass
+                await leave_voice_chat(chat_id)
                 return
 
             # Start progress timer for the new track

@@ -1147,6 +1147,7 @@ async def _fresh_resolve_and_play(chat_id: int, item) -> bool:
             get_audio_stream_url, get_video_stream_url,
             is_youtube_url, search_and_download_audio as yt_search_dl,
             search_and_download_video as yt_search_dl_video,
+            search_youtube as _yt_search,
         )
 
         LOG.info("fresh_resolve: trying YouTube FIRST for %s: '%s'", chat_id, item.title)
@@ -1161,7 +1162,19 @@ async def _fresh_resolve_and_play(chat_id: int, item) -> bool:
                 fresh_path = new_url
                 fresh_is_stream = True
 
-        # Try search+download by title
+        # Try search by title → get stream URL (faster than download)
+        if not fresh_path:
+            yt_result = await _yt_search(item.title)
+            if yt_result and yt_result.get("url"):
+                if item.stream_type == "video":
+                    new_url = await get_video_stream_url(yt_result["url"])
+                else:
+                    new_url = await get_audio_stream_url(yt_result["url"])
+                if new_url:
+                    fresh_path = new_url
+                    fresh_is_stream = True
+
+        # Try search+download by title (local file)
         if not fresh_path:
             if item.stream_type == "video":
                 path, info = await yt_search_dl_video(item.title)
@@ -1182,6 +1195,14 @@ async def _fresh_resolve_and_play(chat_id: int, item) -> bool:
         LOG.info("fresh_resolve: YouTube failed, trying JioSaavn+SoundCloud for '%s'", item.title)
 
         async def _try_jiosaavn(title):
+            try:
+                # Try stream URL first (faster — no download needed)
+                from MusicLyrics.plugins.play.platforms.jiosaavn import search_jiosaavn as _js_search
+                js_result = await _js_search(title)
+                if js_result and js_result.get("download_url"):
+                    return js_result["download_url"], True
+            except Exception:
+                pass
             try:
                 js_path, js_info = await search_and_download_jiosaavn(title)
                 if js_path and _os.path.isfile(str(js_path)):
@@ -1337,17 +1358,34 @@ async def _on_stream_end(client, update):
             try:
                 success = await _fresh_resolve_and_play(chat_id, next_item)
                 if not success:
-                    try:
-                        err_msg = await bot.send_message(
-                            chat_id,
-                            f"❌ **পরের গানটি চলানো যায়নি:** {next_item.title}\n\n"
-                            "Voice chat থেকে বের হচ্ছে। আবার `/play` দিন।",
-                        )
-                        await _add_reaction(chat_id, err_msg.id)
-                    except Exception:
-                        pass
-                    await leave_voice_chat(chat_id)
-                    return
+                    # Try skipping to subsequent tracks before giving up
+                    LOG.warning("Auto-next failed for '%s', trying next tracks in queue", next_item.title)
+                    retries = 0
+                    while retries < 3:
+                        retries += 1
+                        fallback_item = await skip_queue(chat_id, force=True)
+                        if fallback_item is None:
+                            break
+                        try:
+                            success = await _fresh_resolve_and_play(chat_id, fallback_item)
+                            if success:
+                                next_item = fallback_item
+                                break
+                        except Exception:
+                            continue
+
+                    if not success:
+                        try:
+                            err_msg = await bot.send_message(
+                                chat_id,
+                                f"❌ **পরের গানটি চলানো যায়নি:** {next_item.title}\n\n"
+                                "Voice chat থেকে বের হচ্ছে। আবার `/play` দিন।",
+                            )
+                            await _add_reaction(chat_id, err_msg.id)
+                        except Exception:
+                            pass
+                        await leave_voice_chat(chat_id)
+                        return
 
                 dur = format_duration(next_item.duration)
                 color = _get_next_color()

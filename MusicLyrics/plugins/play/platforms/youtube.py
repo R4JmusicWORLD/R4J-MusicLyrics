@@ -1106,16 +1106,15 @@ _CLIENT_COMBOS_WITH_COOKIES: list[list[str]] = [
     ["web_music"],                     # YouTube Music web — good with cookies
     ["web_creator"],                   # Creator Studio client — good for restricted
     ["ios"],                           # iOS client
-    ["ios_music"],                     # iOS Music fallback
     ["android_vr"],                    # Android VR — less monitored by YouTube
     ["web_safari"],                    # Safari — cookies help
     ["mediaconnect"],                  # MediaConnect — newer, less blocked
     ["tv"],                            # Smart TV — fewer restrictions
+    ["android_testsuite"],             # Android Testsuite — direct URLs
 ]
 
 _CLIENT_COMBOS_NO_COOKIES: list[list[str]] = [
     ["ios"],                           # iOS — best without cookies
-    ["ios_music"],                     # iOS Music — rarely blocked
     ["android_vr"],                    # Android VR — less monitored
     ["android_testsuite"],             # Android Testsuite — direct URLs
     ["mediaconnect"],                  # MediaConnect — newer client
@@ -1243,12 +1242,32 @@ async def search_youtube(query: str, max_results: int = 1) -> Optional[dict]:
     This calls YouTube's own search endpoint directly using aiohttp.
     It does NOT trigger bot detection (search != player).
 
+    Fetches extra results internally so lyrics/lyrical videos can be
+    deprioritised — _parse_innertube_results sorts originals first.
+
     Keys: title, url, duration (seconds), thumbnail, channel, video_id.
     """
     try:
-        results = await _innertube_search(query, max_results)
+        # Append "official audio" hint to nudge YouTube toward original songs
+        # (only if the query doesn't already contain platform/filter keywords)
+        search_query = query
+        q_lower = query.lower()
+        if not any(kw in q_lower for kw in ("official", "audio", "video", "lyrics",
+                                             "remix", "cover", "live", "mv")):
+            search_query = f"{query} official audio"
+
+        # Fetch more results than requested so the lyrics filter can
+        # pick the best original song from a wider pool.
+        fetch_count = max(max_results, 5)
+        results = await _innertube_search(search_query, fetch_count)
         if results:
             return results[0]
+
+        # If "official audio" query returned nothing, try original query
+        if search_query != query:
+            results = await _innertube_search(query, fetch_count)
+            if results:
+                return results[0]
     except Exception:
         LOG.exception("Innertube search failed for: %s", query)
 
@@ -1299,9 +1318,32 @@ async def _innertube_search(query: str, limit: int = 5) -> list[dict]:
     return _parse_innertube_results(data, limit)
 
 
+_LYRICS_KEYWORDS = re.compile(
+    r'\b(lyrics?|lyrical|lyric\s*video|lyrics?\s*video|with\s+lyrics?)\b',
+    re.IGNORECASE,
+)
+
+
+def _is_lyrics_video(title: str, channel: str = "") -> bool:
+    """Check if a video is likely a lyrics/lyrical version rather than original."""
+    # Check title for lyrics keywords
+    if _LYRICS_KEYWORDS.search(title):
+        return True
+    # Check channel name for common lyrics channels
+    ch_lower = channel.lower()
+    for kw in ("lyrics", "lyrical", "lyric"):
+        if kw in ch_lower:
+            return True
+    return False
+
+
 def _parse_innertube_results(data: dict, limit: int) -> list[dict]:
-    """Extract video results from innertube search response."""
-    results = []
+    """Extract video results from innertube search response.
+
+    PRIORITISES original songs over lyrics/lyrical videos.
+    Collects all results, then sorts: original songs first, lyrics videos last.
+    """
+    all_results = []
 
     try:
         contents = (
@@ -1352,29 +1394,41 @@ def _parse_innertube_results(data: dict, limit: int) -> list[dict]:
             owner_runs = vr.get("ownerText", {}).get("runs", [])
             channel = owner_runs[0]["text"] if owner_runs else "Unknown"
 
-            results.append({
+            all_results.append({
                 "title": title,
                 "url": f"https://www.youtube.com/watch?v={video_id}",
                 "duration": duration,
                 "thumbnail": thumbnail,
                 "channel": channel,
                 "video_id": video_id,
+                "_is_lyrics": _is_lyrics_video(title, channel),
             })
 
-            if len(results) >= limit:
-                return results
+    # Sort: original songs first, lyrics videos last
+    all_results.sort(key=lambda r: (r.get("_is_lyrics", False),))
+
+    # Remove internal flag and limit results
+    results = []
+    for r in all_results[:limit]:
+        r.pop("_is_lyrics", None)
+        results.append(r)
 
     return results
 
 
 def _ytdlp_search_sync(query: str, max_results: int = 1) -> Optional[dict]:
-    """Fallback: search using yt-dlp with extract_flat (lightweight)."""
+    """Fallback: search using yt-dlp with extract_flat (lightweight).
+
+    Fetches extra results to filter out lyrics/lyrical videos.
+    """
     import yt_dlp
 
+    # Fetch more results to filter lyrics videos
+    fetch_count = max(max_results * 5, 5)
     opts = {
         **_base_ytdlp_opts(),
         "extract_flat": True,
-        "default_search": f"ytsearch{max_results}",
+        "default_search": f"ytsearch{fetch_count}",
     }
 
     try:
@@ -1382,17 +1436,47 @@ def _ytdlp_search_sync(query: str, max_results: int = 1) -> Optional[dict]:
             info = ydl.extract_info(query, download=False)
             if not info:
                 return None
-            entries = info.get("entries")
-            item = entries[0] if entries else info
-            if not item:
+            entries = info.get("entries", [])
+            if not entries:
+                # Single result
+                item = info
+                if not item:
+                    return None
+                vid = item.get("id", "")
+                return {
+                    "title": item.get("title", "Unknown"),
+                    "url": item.get("webpage_url") or item.get("url", ""),
+                    "duration": int(item.get("duration") or 0),
+                    "thumbnail": item.get("thumbnail", ""),
+                    "channel": item.get("uploader") or item.get("channel", "Unknown"),
+                    "video_id": vid,
+                }
+
+            # Prefer non-lyrics videos
+            non_lyrics = []
+            lyrics_items = []
+            for item in entries:
+                if not item:
+                    continue
+                title = item.get("title", "")
+                channel = item.get("uploader") or item.get("channel", "")
+                if _is_lyrics_video(title, channel):
+                    lyrics_items.append(item)
+                else:
+                    non_lyrics.append(item)
+
+            # Pick from non-lyrics first, then lyrics as fallback
+            best = (non_lyrics + lyrics_items)[0] if (non_lyrics or lyrics_items) else None
+            if not best:
                 return None
-            vid = item.get("id", "")
+
+            vid = best.get("id", "")
             return {
-                "title": item.get("title", "Unknown"),
-                "url": item.get("webpage_url") or item.get("url", ""),
-                "duration": int(item.get("duration") or 0),
-                "thumbnail": item.get("thumbnail", ""),
-                "channel": item.get("uploader") or item.get("channel", "Unknown"),
+                "title": best.get("title", "Unknown"),
+                "url": best.get("webpage_url") or best.get("url", ""),
+                "duration": int(best.get("duration") or 0),
+                "thumbnail": best.get("thumbnail", ""),
+                "channel": best.get("uploader") or best.get("channel", "Unknown"),
                 "video_id": vid,
             }
     except Exception:
@@ -1948,10 +2032,23 @@ async def search_and_download_audio(query: str) -> tuple[Optional[str], Optional
     search -> extract URL -> download flow fails due to IP blocking.
     yt-dlp handles search + download atomically.
 
+    First searches for multiple results (extract_flat) to find the best
+    non-lyrics original song, then downloads that specific video.
+
     Returns (filepath, info_dict) or (None, None).
     """
     import yt_dlp
     loop = asyncio.get_running_loop()
+
+    # Step 1: Search for the best non-lyrics video first
+    best_url = None
+    try:
+        search_result = await search_youtube(query, max_results=1)
+        if search_result and search_result.get("url"):
+            best_url = search_result["url"]
+            LOG.info("search_and_download_audio: using filtered result: %s", search_result.get("title", "?"))
+    except Exception:
+        pass
 
     # Try first 2 client combos for search+download
     for combo in _get_client_combos()[:2]:
@@ -1959,7 +2056,6 @@ async def search_and_download_audio(query: str) -> tuple[Optional[str], Optional
             **_base_ytdlp_opts(client_combo=combo),
             "format": "ba/b",
             "outtmpl": os.path.join(_DOWNLOADS, "%(id)s.%(ext)s"),
-            "default_search": "ytsearch",
             "noplaylist": True,
             "overwrites": False,
             "postprocessors": [{
@@ -1968,10 +2064,15 @@ async def search_and_download_audio(query: str) -> tuple[Optional[str], Optional
                 "preferredquality": "128",
             }],
         }
+        # If we don't have a pre-selected URL, use ytsearch
+        if not best_url:
+            opts["default_search"] = "ytsearch"
+
+        dl_query = best_url or query
         try:
             def _do_search_dl():
                 with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(query, download=True)
+                    info = ydl.extract_info(dl_query, download=True)
                     if not info:
                         return None, None
                     # ytsearch returns a playlist-like result
@@ -2023,7 +2124,6 @@ async def search_and_download_audio(query: str) -> tuple[Optional[str], Optional
             **_base_ytdlp_opts(client_combo=combos[0]),
             "format": "ba/b",
             "outtmpl": os.path.join(_DOWNLOADS, "%(id)s.%(ext)s"),
-            "default_search": "ytsearch",
             "noplaylist": True,
             "overwrites": False,
             "postprocessors": [{
@@ -2032,11 +2132,15 @@ async def search_and_download_audio(query: str) -> tuple[Optional[str], Optional
                 "preferredquality": "128",
             }],
         }
+        # Use pre-selected URL if available, otherwise ytsearch
+        noproxy_query = best_url or query
+        if not best_url:
+            opts["default_search"] = "ytsearch"
         opts.pop("proxy", None)  # Force no proxy
         try:
             def _do_noproxy_dl():
                 with _yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(query, download=True)
+                    info = ydl.extract_info(noproxy_query, download=True)
                     if not info:
                         return None, None
                     entries = info.get("entries")
@@ -2081,10 +2185,22 @@ async def search_and_download_audio(query: str) -> tuple[Optional[str], Optional
 async def search_and_download_video(query: str) -> tuple[Optional[str], Optional[dict]]:
     """Search YouTube and download video in one step using yt-dlp's ytsearch.
 
+    Prefers original songs over lyrics/lyrical videos.
+
     Returns (filepath, info_dict) or (None, None).
     """
     import yt_dlp
     loop = asyncio.get_running_loop()
+
+    # Step 1: Search for the best non-lyrics video first
+    best_url = None
+    try:
+        search_result = await search_youtube(query, max_results=1)
+        if search_result and search_result.get("url"):
+            best_url = search_result["url"]
+            LOG.info("search_and_download_video: using filtered result: %s", search_result.get("title", "?"))
+    except Exception:
+        pass
 
     # Try first 2 client combos for video search+download
     for combo in _get_client_combos()[:2]:
@@ -2093,7 +2209,6 @@ async def search_and_download_video(query: str) -> tuple[Optional[str], Optional
             "format": "bv*[height<=720]+ba/bv+ba/b",
             "outtmpl": os.path.join(_DOWNLOADS, "%(id)s_video.%(ext)s"),
             "merge_output_format": "mp4",
-            "default_search": "ytsearch",
             "noplaylist": True,
             "overwrites": False,
             "postprocessors": [{
@@ -2101,10 +2216,15 @@ async def search_and_download_video(query: str) -> tuple[Optional[str], Optional
                 "preferedformat": "mp4",
             }],
         }
+        # If we don't have a pre-selected URL, use ytsearch
+        if not best_url:
+            opts["default_search"] = "ytsearch"
+
+        dl_query = best_url or query
         try:
             def _do_search_dl():
                 with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(query, download=True)
+                    info = ydl.extract_info(dl_query, download=True)
                     if not info:
                         return None, None
                     entries = info.get("entries")
@@ -2156,7 +2276,6 @@ async def search_and_download_video(query: str) -> tuple[Optional[str], Optional
             "format": "bv*[height<=720]+ba/bv+ba/b",
             "outtmpl": os.path.join(_DOWNLOADS, "%(id)s_video.%(ext)s"),
             "merge_output_format": "mp4",
-            "default_search": "ytsearch",
             "noplaylist": True,
             "overwrites": False,
             "postprocessors": [{
@@ -2164,11 +2283,15 @@ async def search_and_download_video(query: str) -> tuple[Optional[str], Optional
                 "preferedformat": "mp4",
             }],
         }
+        # Use pre-selected URL if available, otherwise ytsearch
+        noproxy_query = best_url or query
+        if not best_url:
+            opts["default_search"] = "ytsearch"
         opts.pop("proxy", None)  # Force no proxy
         try:
             def _do_noproxy_dl():
                 with _yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(query, download=True)
+                    info = ydl.extract_info(noproxy_query, download=True)
                     if not info:
                         return None, None
                     entries = info.get("entries")
