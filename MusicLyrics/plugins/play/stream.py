@@ -1295,6 +1295,10 @@ async def _on_stream_end(client, update):
                  chat_id, _suppress_stream_end[chat_id])
         return
 
+    # This is a REAL stream-end (track finished naturally).
+    # Reset the suppress counter to 0 so no stale suppressions remain.
+    _suppress_stream_end.pop(chat_id, None)
+
     # Prevent double-processing: if auto-next is already running for this chat, skip
     if chat_id in _auto_next_in_progress:
         LOG.info("Auto-next already in progress for %s — ignoring duplicate stream-end event", chat_id)
@@ -1355,6 +1359,11 @@ async def _on_stream_end(client, update):
                 return
 
             # Play next track (INSIDE lock to prevent race with manual skip)
+            # Remove from _active_chats so _do_play does NOT add a false
+            # suppress_next_stream_end (the old stream already ended naturally,
+            # there is no old-stream event to suppress).
+            _active_chats.discard(chat_id)
+
             try:
                 success = await _fresh_resolve_and_play(chat_id, next_item)
                 if not success:

@@ -123,9 +123,11 @@ async def skip_cmd(client: Client, message: Message):
             return
 
         try:
-            # Suppress the stream-end event that will fire when we replace
-            # the current stream — otherwise _on_stream_end double-advances
-            suppress_next_stream_end(chat_id)
+            # NOTE: Do NOT call suppress_next_stream_end here!
+            # _do_play() (called inside _fresh_resolve_and_play → stream_audio)
+            # already suppresses the stream-end event for the OLD stream.
+            # Adding it here causes DOUBLE suppression — the real stream-end
+            # for the NEW track also gets swallowed, breaking auto-next.
 
             # Fresh-resolve media across platforms (YouTube first)
             success = await _fresh_resolve_and_play(chat_id, next_item)
@@ -138,7 +140,6 @@ async def skip_cmd(client: Client, message: Message):
                     fallback_item = await skip_queue(chat_id, force=True)
                     if fallback_item is None:
                         break
-                    suppress_next_stream_end(chat_id)
                     try:
                         success = await _fresh_resolve_and_play(chat_id, fallback_item)
                         if success:
@@ -438,9 +439,10 @@ async def cb_skip(client: Client, callback: CallbackQuery):
             return
 
         try:
-            # Suppress the stream-end event that will fire when we replace
-            # the current stream — otherwise _on_stream_end double-advances
-            suppress_next_stream_end(chat_id)
+            # NOTE: Do NOT call suppress_next_stream_end here!
+            # _do_play() already handles suppression internally.
+            # Double suppression causes the NEW track's stream-end to be
+            # swallowed too, breaking auto-next / sequential playback.
 
             # Fresh-resolve media across platforms (YouTube first)
             success = await _fresh_resolve_and_play(chat_id, next_item)
@@ -453,7 +455,6 @@ async def cb_skip(client: Client, callback: CallbackQuery):
                     fallback_item = await skip_queue(chat_id, force=True)
                     if fallback_item is None:
                         break
-                    suppress_next_stream_end(chat_id)
                     try:
                         success = await _fresh_resolve_and_play(chat_id, fallback_item)
                         if success:
@@ -465,7 +466,7 @@ async def cb_skip(client: Client, callback: CallbackQuery):
             if not success:
                 try:
                     err_reply = await callback.message.reply_text(
-                        "❌ Skip করা যায়নি — গানগুলো চলানো সম্ভব হচ্ছে না।\n"
+                        "❌ Skip করা যায়নি -- গানগুলো চলানো সম্ভব হচ্ছে না।\n"
                         "Voice chat থেকে বের হচ্ছি।"
                     )
                 except Exception:
