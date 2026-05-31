@@ -288,10 +288,13 @@ async def queue_cmd(client: Client, message: Message):
     cq = await get_chat_queue(chat_id)
     lines = ["**📜 Current Queue:**\n"]
     for i, item in enumerate(items):
-        marker = "▶️" if i == cq.current_index else f"{i + 1}."
         dur = format_duration(item.duration)
         kind = "🎬" if item.stream_type == "video" else "🎵"
-        lines.append(f"{marker} {kind} **{item.title}** [{dur}] — {item.requester}")
+        if i == 0:
+            # Currently playing (always index 0 now)
+            lines.append(f"▶️ {kind} **{item.title}** [{dur}] — {item.requester}")
+        else:
+            lines.append(f"{i}. {kind} **{item.title}** [{dur}] — {item.requester}")
     loop_status = "🔁 Loop: ON" if cq.loop_mode else "🔁 Loop: OFF"
     lines.append(f"\n{loop_status}")
     reply = await message.reply_text("\n".join(lines))
@@ -538,9 +541,11 @@ async def cb_queue(client: Client, callback: CallbackQuery):
     cq = await get_chat_queue(chat_id)
     lines = []
     for i, item in enumerate(items):
-        marker = "▶️" if i == cq.current_index else f"{i + 1}."
         dur = format_duration(item.duration)
-        lines.append(f"{marker} {item.title} [{dur}]")
+        if i == 0:
+            lines.append(f"▶️ {item.title} [{dur}]")
+        else:
+            lines.append(f"{i}. {item.title} [{dur}]")
     text = "\n".join(lines[:15])  # limit to 15 to avoid message length issues
     if len(items) > 15:
         text += f"\n\n... এবং আরো {len(items) - 15}টি গান"

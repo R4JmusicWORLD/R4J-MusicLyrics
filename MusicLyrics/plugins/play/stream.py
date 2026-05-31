@@ -1174,7 +1174,7 @@ async def _fresh_resolve_and_play(chat_id: int, item) -> bool:
                 if new_url:
                     return new_url, True, "youtube"
 
-            # Try search+download by title (local file)
+            # Try search+download by title (local file — last resort)
             if item.stream_type == "video":
                 path, info = await yt_search_dl_video(item.title)
             else:
@@ -1264,20 +1264,40 @@ async def _on_stream_end(client, update):
 
     try:
         # Try various ways to get chat_id from the update object
-        if hasattr(update, "chat_id"):
-            chat_id = update.chat_id
+        if isinstance(update, int):
+            chat_id = update
+        elif hasattr(update, "chat_id"):
+            _cid = update.chat_id
+            # Handle property that might return a coroutine
+            if asyncio.iscoroutine(_cid):
+                _cid = await _cid
+            chat_id = _cid
         elif hasattr(update, "chat"):
             chat_obj = update.chat
+            if asyncio.iscoroutine(chat_obj):
+                chat_obj = await chat_obj
             if isinstance(chat_obj, dict):
                 chat_id = chat_obj.get("id")
             elif isinstance(chat_obj, int):
                 chat_id = chat_obj
             elif hasattr(chat_obj, "id"):
                 chat_id = chat_obj.id
-        elif isinstance(update, int):
-            chat_id = update
         elif isinstance(update, dict):
             chat_id = update.get("chat_id") or update.get("chat", {}).get("id")
+    except TypeError:
+        # Handle "abstract ... can't be used in 'await' expression"
+        # by trying direct attribute access without await
+        try:
+            if hasattr(update, "chat_id"):
+                chat_id = update.chat_id
+            elif hasattr(update, "chat"):
+                chat_obj = update.chat
+                if isinstance(chat_obj, int):
+                    chat_id = chat_obj
+                elif hasattr(chat_obj, "id"):
+                    chat_id = chat_obj.id
+        except Exception:
+            pass
     except Exception as e:
         LOG.warning("Error extracting chat_id from stream end event: %s", e)
         return
@@ -1446,6 +1466,16 @@ if pytgcalls is not None:
         """1-arg handler for newer py-tgcalls versions."""
         try:
             await _on_stream_end(None, update)
+        except TypeError as e:
+            # Handle "abstract stream.end can't be used in 'await' expression"
+            LOG.debug("TypeError in stream-end handler (handled): %s", e)
+            # Try extracting chat_id directly without async
+            try:
+                cid = getattr(update, 'chat_id', None)
+                if cid is not None:
+                    await _on_stream_end(None, cid)
+            except Exception:
+                pass
         except Exception as e:
             LOG.exception("Error in _safe_stream_end_1arg: %s", e)
 
@@ -1453,6 +1483,14 @@ if pytgcalls is not None:
         """2-arg handler for older py-tgcalls versions."""
         try:
             await _on_stream_end(client, update)
+        except TypeError as e:
+            LOG.debug("TypeError in stream-end handler (handled): %s", e)
+            try:
+                cid = getattr(update, 'chat_id', None)
+                if cid is not None:
+                    await _on_stream_end(client, cid)
+            except Exception:
+                pass
         except Exception as e:
             LOG.exception("Error in _safe_stream_end_2arg: %s", e)
 

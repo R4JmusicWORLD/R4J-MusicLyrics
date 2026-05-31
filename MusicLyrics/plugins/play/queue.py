@@ -91,6 +91,10 @@ async def skip_queue(chat_id: int, force: bool = False) -> Optional[QueueItem]:
 
     If *force* is True, skip even when loop mode is on (user pressed Skip).
     Auto-next (stream-end) should call with force=False so loop replays.
+
+    Played/skipped items are REMOVED from the queue so they don't linger.
+    The current_index always stays at 0 — the head of the list is always
+    the currently playing track.
     """
     async with _lock:
         cq = _queues.get(chat_id)
@@ -103,8 +107,15 @@ async def skip_queue(chat_id: int, force: bool = False) -> Optional[QueueItem]:
         if cq.loop_mode and force:
             cq.loop_mode = False
 
-        cq.current_index += 1
-        if cq.current_index >= len(cq.items):
+        # Remove the finished/skipped item from the front of the queue
+        if cq.items:
+            removed = cq.items.pop(0)
+            LOG.info("Queue %s: removed played track — %s", chat_id, removed.title)
+
+        # Reset index to 0 (head is always current)
+        cq.current_index = 0
+
+        if not cq.items:
             return None  # queue exhausted
         return cq.current
 
@@ -125,13 +136,13 @@ async def toggle_loop(chat_id: int) -> bool:
 async def shuffle_queue(chat_id: int) -> None:
     """Shuffle upcoming items (keep current track in place)."""
     cq = await get_chat_queue(chat_id)
-    upcoming_start = cq.current_index + 1
-    if upcoming_start < len(cq.items):
-        upcoming = cq.items[upcoming_start:]
+    # Since current is always at index 0, shuffle everything after index 0
+    if len(cq.items) > 1:
+        upcoming = cq.items[1:]
         random.shuffle(upcoming)
-        cq.items[upcoming_start:] = upcoming
+        cq.items[1:] = upcoming
     LOG.info("Queue %s: shuffled %d upcoming tracks.", chat_id,
-             max(0, len(cq.items) - upcoming_start))
+             max(0, len(cq.items) - 1))
 
 
 def format_duration(seconds: int) -> str:
