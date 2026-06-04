@@ -59,7 +59,7 @@ class Config:
     SUPPORT_CHANNEL = os.environ.get(
         "SUPPORT_CHANNEL", "https://t.me/RupkothaGolpo"
     )
-    OWNER_LINK = "https://t.me/Raj_81"
+    OWNER_LINK = "https://t.me/R4J_81"
 
     BOT_NAME = os.environ.get("BOT_USERNAME", "MusicLyrics")
     BRAND_PHOTO = (
