@@ -45,7 +45,6 @@ from MusicLyrics.plugins.play.stream import (
     _add_reaction,
     suppress_next_stream_end,
     _fresh_resolve_and_play,
-    _cancel_safety_leave,
 )
 from MusicLyrics.plugins.play.prefetch import prefetch_next
 from MusicLyrics.utils.autodelete import (
@@ -55,19 +54,6 @@ from MusicLyrics.utils.autodelete import (
 )
 
 LOG = logging.getLogger(__name__)
-
-
-async def _is_admin(chat_id: int, user_id: int) -> bool:
-    """Check if user is admin or owner in the chat."""
-    from config import Config
-    # Owner/Sudo users always have admin access
-    if user_id in Config.SUDO_USERS or user_id == Config.OWNER_ID:
-        return True
-    try:
-        member = await bot.get_chat_member(chat_id, user_id)
-        return member.status in ("creator", "administrator")
-    except Exception:
-        return False
 
 
 # ── /pause ───────────────────────────────────────────────────────────────────
@@ -120,9 +106,8 @@ async def skip_cmd(client: Client, message: Message):
     # this command can still proceed instead of deadlocking forever.
     lock = await acquire_skip_lock(chat_id, timeout=12.0)
     try:
-        # Stop progress timer and cancel safety leave
+        # Stop progress timer
         _stop_progress_timer(chat_id)
-        _cancel_safety_leave(chat_id)
 
         # Delete previous "Now Playing" messages
         if chat_id in _now_playing_messages:
@@ -136,13 +121,10 @@ async def skip_cmd(client: Client, message: Message):
         next_item = await skip_queue(chat_id, force=True)
         if next_item is None:
             await leave_voice_chat(chat_id)
-            try:
-                reply = await message.reply_text(
-                    "✅ **Queue শেষ হয়ে গেছে!**\n\n"
-                    "Voice chat থেকে বের হচ্ছি।"
-                )
-            except Exception:
-                pass
+            reply = await message.reply_text(
+                "✅ **Queue শেষ হয়ে গেছে!**\n\n"
+                "Voice chat থেকে বের হচ্ছি।"
+            )
             await _add_reaction(chat_id, message.id)
             return
 
@@ -159,7 +141,7 @@ async def skip_cmd(client: Client, message: Message):
             try:
                 success = await asyncio.wait_for(
                     _fresh_resolve_and_play(chat_id, next_item),
-                    timeout=15.0,
+                    timeout=25.0,
                 )
             except asyncio.TimeoutError:
                 LOG.warning("Skip resolve+play TIMED OUT for %s", chat_id)
@@ -173,14 +155,10 @@ async def skip_cmd(client: Client, message: Message):
             except Exception:
                 pass
 
-            # Let py-tgcalls stabilize before starting next operation
-            if success:
-                await asyncio.sleep(0.3)
-
-            # If this track failed, try up to 2 subsequent tracks
+            # If this track failed, try up to 3 subsequent tracks
             if not success:
                 retries = 0
-                while retries < 2:
+                while retries < 3:
                     retries += 1
                     fallback_item = await skip_queue(chat_id, force=True)
                     if fallback_item is None:
@@ -188,7 +166,7 @@ async def skip_cmd(client: Client, message: Message):
                     try:
                         success = await asyncio.wait_for(
                             _fresh_resolve_and_play(chat_id, fallback_item),
-                            timeout=15.0,
+                            timeout=25.0,
                         )
                         if success:
                             next_item = fallback_item
@@ -250,9 +228,8 @@ async def stop_cmd(client: Client, message: Message):
     # lock so /stop always works.
     lock = await acquire_skip_lock(chat_id, timeout=10.0)
     try:
-        # Stop progress timer and cancel safety leave
+        # Stop progress timer
         _stop_progress_timer(chat_id)
-        _cancel_safety_leave(chat_id)
 
         # Delete previous "Now Playing" messages
         if chat_id in _now_playing_messages:
@@ -459,16 +436,6 @@ async def cb_resume(client: Client, callback: CallbackQuery):
 @bot.on_callback_query(filters.regex(r"^ctl_skip$"))
 async def cb_skip(client: Client, callback: CallbackQuery):
     chat_id = callback.message.chat.id
-
-    # Admin-only check for Skip button
-    user_id = callback.from_user.id if callback.from_user else 0
-    if not await _is_admin(chat_id, user_id):
-        try:
-            await callback.answer("⚠️ শুধু এডমিন Skip করতে পারবে!", show_alert=True)
-        except Exception:
-            pass
-        return
-
     if not is_active(chat_id):
         try:
             await callback.answer("কিছু চলছে না!", show_alert=True)
@@ -490,9 +457,8 @@ async def cb_skip(client: Client, callback: CallbackQuery):
         if not is_active(chat_id):
             return
 
-        # Stop progress timer and cancel safety leave
+        # Stop progress timer
         _stop_progress_timer(chat_id)
-        _cancel_safety_leave(chat_id)
 
         # Delete previous "Now Playing" messages
         if chat_id in _now_playing_messages:
@@ -505,7 +471,6 @@ async def cb_skip(client: Client, callback: CallbackQuery):
 
         next_item = await skip_queue(chat_id, force=True)
         if next_item is None:
-            await leave_voice_chat(chat_id)
             try:
                 reply = await callback.message.reply_text(
                     "✅ **Queue শেষ হয়ে গেছে!**\n\n"
@@ -513,6 +478,7 @@ async def cb_skip(client: Client, callback: CallbackQuery):
                 )
             except Exception:
                 pass
+            await leave_voice_chat(chat_id)
             return
 
         try:
@@ -526,7 +492,7 @@ async def cb_skip(client: Client, callback: CallbackQuery):
             try:
                 success = await asyncio.wait_for(
                     _fresh_resolve_and_play(chat_id, next_item),
-                    timeout=15.0,
+                    timeout=25.0,
                 )
             except asyncio.TimeoutError:
                 LOG.warning("cb_skip resolve+play TIMED OUT for %s", chat_id)
@@ -540,14 +506,10 @@ async def cb_skip(client: Client, callback: CallbackQuery):
             except Exception:
                 pass
 
-            # Let py-tgcalls stabilize before starting next operation
-            if success:
-                await asyncio.sleep(0.3)
-
-            # If this track failed, try up to 2 subsequent tracks
+            # If this track failed, try up to 3 subsequent tracks
             if not success:
                 retries = 0
-                while retries < 2:
+                while retries < 3:
                     retries += 1
                     fallback_item = await skip_queue(chat_id, force=True)
                     if fallback_item is None:
@@ -555,7 +517,7 @@ async def cb_skip(client: Client, callback: CallbackQuery):
                     try:
                         success = await asyncio.wait_for(
                             _fresh_resolve_and_play(chat_id, fallback_item),
-                            timeout=15.0,
+                            timeout=25.0,
                         )
                         if success:
                             next_item = fallback_item
@@ -609,15 +571,6 @@ async def cb_skip(client: Client, callback: CallbackQuery):
 async def cb_stop(client: Client, callback: CallbackQuery):
     """CLOSE button — only deletes the Now Playing message, does NOT stop playback."""
     chat_id = callback.message.chat.id
-
-    # Admin-only check for Close button
-    user_id = callback.from_user.id if callback.from_user else 0
-    if not await _is_admin(chat_id, user_id):
-        try:
-            await callback.answer("⚠️ শুধু এডমিন Close করতে পারবে!", show_alert=True)
-        except Exception:
-            pass
-        return
 
     # Answer callback immediately
     try:

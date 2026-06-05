@@ -79,7 +79,7 @@ _skip_locks: dict[int, asyncio.Lock] = {}
 # stale suppressions cannot accumulate and silently swallow REAL stream-end
 # events (which would cause "bot stuck in VC" symptoms).
 _suppress_stream_end: dict[int, list[float]] = {}
-_SUPPRESS_TTL_SEC = 5.0  # window in which a replacing play() should fire its old-stream-end event
+_SUPPRESS_TTL_SEC = 8.0  # window in which a replacing play() should fire its old-stream-end event
 
 
 def suppress_next_stream_end(chat_id: int) -> None:
@@ -298,89 +298,6 @@ except ImportError:
 # Track chats where auto-next is already being processed (prevents double-skip)
 _auto_next_in_progress: set[int] = set()
 
-# Per-chat play concurrency semaphore — prevents multiple /play commands from
-# resolving media at the same time in the same chat, which causes the bot to
-# freeze when many songs are requested simultaneously.
-_play_semaphores: dict[int, asyncio.Semaphore] = {}
-
-
-def _get_play_semaphore(chat_id: int) -> asyncio.Semaphore:
-    """Get or create a per-chat play concurrency semaphore."""
-    if chat_id not in _play_semaphores:
-        _play_semaphores[chat_id] = asyncio.Semaphore(1)
-    return _play_semaphores[chat_id]
-
-
-# Safety auto-leave timer — if _on_stream_end doesn't fire within this many
-# seconds after a track should have ended, force-leave the voice chat.
-# This prevents the bot from staying in VC forever when py-tgcalls fails to
-# fire the stream-end callback.
-_safety_leave_tasks: dict[int, asyncio.Task] = {}
-_SAFETY_LEAVE_BUFFER = 60  # seconds after expected track end to force leave
-
-
-def _schedule_safety_leave(chat_id: int, duration: int) -> None:
-    """Schedule a safety auto-leave timer for the chat.
-
-    If _on_stream_end doesn't fire (or fires too late), this timer will
-    force the bot to leave the voice chat so it doesn't stay stuck forever.
-    The timer is cancelled whenever a new track starts, a manual skip/stop
-    happens, or _on_stream_end fires successfully.
-    """
-    _cancel_safety_leave(chat_id)
-    delay = duration + _SAFETY_LEAVE_BUFFER if duration > 0 else 600
-
-    async def _safety_leave_worker():
-        try:
-            await asyncio.sleep(delay)
-            # If we get here, the stream-end event never fired
-            if chat_id in _active_chats:
-                LOG.warning(
-                    "Safety auto-leave triggered for %s — stream-end callback "
-                    "never fired after %ds", chat_id, delay,
-                )
-                # Check if queue still has items
-                from MusicLyrics.plugins.play.queue import get_queue
-                items = await get_queue(chat_id)
-                if not items:
-                    await leave_voice_chat(chat_id)
-                    try:
-                        t = _get_current_theme()
-                        await bot.send_message(
-                            chat_id,
-                            f"▸ **ꜱᴏɴɢ ᴇɴᴅᴇᴅ** ✅\n\n"
-                            f"🔄 আবার গান শুনতে `/play` কমান্ড দিন।\n\n"
-                            f"🦋 ✦ᴘᴏᴡєʀєᴅ ʙʏ » ── [@R4J_81](https://t.me/R4J_81)",
-                            reply_markup=_song_ended_keyboard(),
-                        )
-                    except Exception:
-                        pass
-                else:
-                    # There are still items — try auto-next manually
-                    LOG.info("Safety timer: queue not empty in %s, triggering manual auto-next", chat_id)
-                    try:
-                        await _on_stream_end(None, chat_id)
-                    except Exception as e:
-                        LOG.warning("Safety manual auto-next failed for %s: %s", chat_id, e)
-                        await leave_voice_chat(chat_id)
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            LOG.debug("Safety leave task error for %s: %s", chat_id, e)
-
-    task = asyncio.create_task(_safety_leave_worker())
-    _safety_leave_tasks[chat_id] = task
-
-
-def _cancel_safety_leave(chat_id: int) -> None:
-    """Cancel the safety auto-leave timer for a chat."""
-    task = _safety_leave_tasks.pop(chat_id, None)
-    if task and not task.done():
-        try:
-            task.cancel()
-        except Exception:
-            pass
-
 
 async def _add_reaction(chat_id: int, message_id: int) -> None:
     """Add a random reaction to a bot message (fire-and-forget).
@@ -516,19 +433,37 @@ def _get_current_theme() -> dict:
 
 
 def _control_keyboard(color: str = "") -> InlineKeyboardMarkup:
-    """Build compact control keyboard with minimal buttons.
+    """Build stylish premium control keyboard with animated emoji icons.
 
-    Normal users: Resume, Pause
-    Admin-only: Skip, Close (enforced in callback handlers)
-    Queue is available via /queue command instead of a button.
+    Buttons match the reference photo style — colorful emojis that rotate
+    through themes on each progress update creating animation effect.
+    YORSA button links to user's GitHub repo.
     """
     t = _get_current_theme()
+    bot_username = bot.me.username if bot.me else "MusicLyrics"
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton(f"{t['resume']} Resume", callback_data="ctl_resume"),
                 InlineKeyboardButton(f"{t['mute']} Pause", callback_data="ctl_pause"),
+                InlineKeyboardButton(f"{t['song']} Queue", callback_data="ctl_queue"),
                 InlineKeyboardButton(f"{t['skip']} Skip", callback_data="ctl_skip"),
+            ],
+            [
+                InlineKeyboardButton(
+                    f"➕ ᴀᴅᴅ ᴛᴏ ɢʀᴏᴜᴘ {t['yorsa']}",
+                    url=f"https://t.me/{bot_username}?startgroup=true",
+                ),
+                InlineKeyboardButton(
+                    f"{t['home']} 💬 ꜱᴜᴘᴘᴏʀᴛ",
+                    url=Config.SUPPORT_GROUP,
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    f"{t['close']}  ✧ CLOSE ✧  {t['close']}",
+                    callback_data="ctl_stop",
+                ),
             ],
         ]
     )
@@ -871,10 +806,7 @@ async def _start_progress_timer(chat_id: int, duration: int):
     
     _play_start_times[chat_id] = time.time()
     _play_durations[chat_id] = duration
-
-    # Schedule safety auto-leave in case _on_stream_end never fires
-    _schedule_safety_leave(chat_id, duration)
-
+    
     async def _update_progress():
         """Periodically update the Now Playing message with progress."""
         update_interval = 5  # Update every 5 seconds
@@ -1342,9 +1274,8 @@ async def leave_voice_chat(chat_id: int) -> None:
     of sync (e.g. pytgcalls.play() partially succeeded, or we lost track of
     a leave event).  Cleanup of local state runs unconditionally.
     """
-    # Stop progress timer, cancel any pending prefetch, and cancel safety leave
+    # Stop progress timer & cancel any pending prefetch immediately
     _stop_progress_timer(chat_id)
-    _cancel_safety_leave(chat_id)
     try:
         cancel_prefetch(chat_id)
     except Exception:
@@ -1402,8 +1333,6 @@ async def leave_voice_chat(chat_id: int) -> None:
     _skip_locks.pop(chat_id, None)
     _suppress_stream_end.pop(chat_id, None)
     _auto_next_in_progress.discard(chat_id)
-    _play_semaphores.pop(chat_id, None)
-    _cancel_safety_leave(chat_id)
     await clear_queue(chat_id)
 
 
@@ -1630,9 +1559,6 @@ async def _on_stream_end(client, update):
 
     LOG.info("Stream end event for chat %s", chat_id)
 
-    # Cancel the safety auto-leave timer since _on_stream_end did fire
-    _cancel_safety_leave(chat_id)
-
     # Suppress events caused by manual skip/stop replacing the current stream.
     # _do_play triggers StreamAudioEnded for the OLD stream — swallow it here.
     if _consume_suppression(chat_id):
@@ -1679,14 +1605,11 @@ async def _on_stream_end(client, update):
                         LOG.debug("Deleted previous Now Playing message in %s", chat_id)
                     except Exception:
                         pass
-                    await asyncio.sleep(0.2)
                 _now_playing_messages[chat_id].clear()
 
             next_item = await skip_queue(chat_id, force=False)
             if next_item is None:
-                # Queue is empty — leave VC FIRST, then send "song ended" message
-                await leave_voice_chat(chat_id)
-                LOG.info("Queue empty, left voice chat in %s", chat_id)
+                # Queue is empty — send "song ended" message with add-to-group button
                 try:
                     t = _get_current_theme()
                     finish_msg = await bot.send_message(
@@ -1701,6 +1624,9 @@ async def _on_stream_end(client, update):
                     await _add_reaction(chat_id, finish_msg.id)
                 except Exception:
                     pass
+                # Now leave the voice chat
+                await leave_voice_chat(chat_id)
+                LOG.info("Queue empty, left voice chat in %s", chat_id)
                 return
 
             # Play next track (INSIDE lock to prevent race with manual skip)
@@ -1708,12 +1634,6 @@ async def _on_stream_end(client, update):
             # suppress_next_stream_end (the old stream already ended naturally,
             # there is no old-stream event to suppress).
             _active_chats.discard(chat_id)
-
-            # If next_item is None after discard, leave immediately
-            if next_item is None:
-                await leave_voice_chat(chat_id)
-                LOG.info("No next item after discard, left voice chat in %s", chat_id)
-                return
 
             try:
                 success = await _fresh_resolve_and_play(chat_id, next_item)
@@ -1727,7 +1647,7 @@ async def _on_stream_end(client, update):
                     # Try skipping to subsequent tracks before giving up
                     LOG.warning("Auto-next failed for '%s', trying next tracks in queue", next_item.title)
                     retries = 0
-                    while retries < 2:
+                    while retries < 3:
                         retries += 1
                         fallback_item = await skip_queue(chat_id, force=True)
                         if fallback_item is None:

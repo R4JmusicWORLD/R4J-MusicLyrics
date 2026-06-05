@@ -43,8 +43,6 @@ from MusicLyrics.plugins.play.stream import (
     leave_voice_chat,
     _get_skip_lock,
     acquire_skip_lock,
-    _get_play_semaphore,
-    _cancel_safety_leave,
 )
 from MusicLyrics.plugins.play.prefetch import prefetch_next, mark_resolved
 from MusicLyrics.plugins.play.platforms.youtube import (
@@ -565,35 +563,27 @@ async def play_command(client: Client, message: Message):
 
     platform = _detect_platform(query)
 
-    # Use per-chat semaphore to prevent multiple concurrent /play resolves
-    # in the same chat — this prevents the bot from freezing when many
-    # songs are requested at the same time.
-    sem = _get_play_semaphore(chat_id)
-    if sem.locked():
-        # Another resolve is already running — wait for it
-        await status_msg.edit_text("⏳ আগের গান প্রসেস হচ্ছে... অপেক্ষা করুন।")
-    async with sem:
+    try:
+        # Pre-join VC concurrently while resolving media (speed optimization)
+        pre_join_task = asyncio.create_task(pre_join_vc(chat_id))
         try:
-            # Pre-join VC concurrently while resolving media (speed optimization)
-            pre_join_task = asyncio.create_task(pre_join_vc(chat_id))
+            info, media_path, is_stream = await _resolve_query(query, platform, message)
+        finally:
+            # Ensure pre-join task completes (or is cancelled)
             try:
-                info, media_path, is_stream = await _resolve_query(query, platform, message)
-            finally:
-                # Ensure pre-join task completes (or is cancelled)
-                try:
-                    await pre_join_task
-                except Exception:
-                    pass
-        except ValueError as exc:
-            await status_msg.edit_text(f"❌ **Error:** {exc}")
-            return
-        except Exception as exc:
-            LOG.exception("Unexpected error in /play for %s", chat_id)
-            await status_msg.edit_text(
-                f"❌ কিছু একটা সমস্যা হয়েছে। পরে আবার চেষ্টা করুন।\n"
-                f"**Details:** `{type(exc).__name__}: {str(exc)[:200]}`"
-            )
-            return
+                await pre_join_task
+            except Exception:
+                pass
+    except ValueError as exc:
+        await status_msg.edit_text(f"❌ **Error:** {exc}")
+        return
+    except Exception as exc:
+        LOG.exception("Unexpected error in /play for %s", chat_id)
+        await status_msg.edit_text(
+            f"❌ কিছু একটা সমস্যা হয়েছে। পরে আবার চেষ্টা করুন।\n"
+            f"**Details:** `{type(exc).__name__}: {str(exc)[:200]}`"
+        )
+        return
 
     title = info.get("title", "Unknown")
     duration = info.get("duration", 0)
@@ -744,7 +734,6 @@ async def playforce_command(client: Client, message: Message):
         lock = await acquire_skip_lock(chat_id, timeout=10.0)
         try:
             _stop_progress_timer(chat_id)
-            _cancel_safety_leave(chat_id)
             # Delete previous "Now Playing" messages
             if chat_id in _now_playing_messages:
                 for old_msg in _now_playing_messages[chat_id]:
