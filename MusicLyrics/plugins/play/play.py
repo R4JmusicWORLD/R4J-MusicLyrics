@@ -46,6 +46,30 @@ from MusicLyrics.plugins.play.stream import (
     acquire_skip_lock,
 )
 from MusicLyrics.plugins.play.prefetch import prefetch_next, mark_resolved
+
+
+async def _safe_edit(msg, text: str, **kwargs) -> bool:
+    """Edit a status message, silently ignoring deleted/expired messages.
+
+    Without this, MessageIdInvalid raised inside an error handler bubbles
+    up as an unhandled exception and freezes the dispatcher.
+    """
+    if msg is None:
+        return False
+    try:
+        await msg.edit_text(text, **kwargs)
+        return True
+    except Exception:
+        try:
+            chat_obj = getattr(msg, "chat", None)
+            chat_id = getattr(chat_obj, "id", None) if chat_obj else None
+            if chat_id is not None:
+                await bot.send_message(chat_id, text, **kwargs)
+                return True
+        except Exception:
+            pass
+        return False
+
 from MusicLyrics.plugins.play.platforms.youtube import (
     search_youtube,
     get_audio_stream_url,
@@ -576,13 +600,14 @@ async def play_command(client: Client, message: Message):
             except Exception:
                 pass
     except ValueError as exc:
-        await status_msg.edit_text(f"❌ **Error:** {exc}")
+        await _safe_edit(status_msg, f"❌ **Error:** {exc}")
         return
     except Exception as exc:
         LOG.exception("Unexpected error in /play for %s", chat_id)
-        await status_msg.edit_text(
+        await _safe_edit(
+            status_msg,
             f"❌ কিছু একটা সমস্যা হয়েছে। পরে আবার চেষ্টা করুন।\n"
-            f"**Details:** `{type(exc).__name__}: {str(exc)[:200]}`"
+            f"**Details:** `{type(exc).__name__}: {str(exc)[:200]}`",
         )
         return
 
@@ -637,25 +662,40 @@ async def play_command(client: Client, message: Message):
         )
     except FileNotFoundError:
         LOG.exception("Media not found for stream in %s", chat_id)
-        await status_msg.edit_text(
+        await _safe_edit(
+            status_msg,
             "❌ মিডিয়া ফাইল/URL পাওয়া যায়নি।\n"
-            "আবার `/play` দিয়ে চেষ্টা করুন।"
+            "আবার `/play` দিয়ে চেষ্টা করুন।",
         )
+        try:
+            await leave_voice_chat(chat_id)
+        except Exception:
+            pass
         return
     except RuntimeError as exc:
-        await status_msg.edit_text(
+        await _safe_edit(
+            status_msg,
             f"❌ {exc}\n\n"
-            "STRING_SESSION সেট করা আছে কিনা চেক করুন।"
+            "STRING_SESSION সেট করা আছে কিনা চেক করুন।",
         )
+        try:
+            await leave_voice_chat(chat_id)
+        except Exception:
+            pass
         return
     except Exception as exc:
         LOG.exception("Stream start failed in %s", chat_id)
-        await status_msg.edit_text(
+        await _safe_edit(
+            status_msg,
             "❌ Voice chat-এ connect করা যাচ্ছে না।\n"
             "নিশ্চিত করুন voice chat চালু আছে এবং "
             "assistant গ্রুপে আছে।\n\n"
-            f"**Error:** `{type(exc).__name__}: {str(exc)[:150]}`"
+            f"**Error:** `{type(exc).__name__}: {str(exc)[:150]}`",
         )
+        try:
+            await leave_voice_chat(chat_id)
+        except Exception:
+            pass
         return
 
     # Start the progress timer for this track
@@ -763,13 +803,14 @@ async def playforce_command(client: Client, message: Message):
             except Exception:
                 pass
     except ValueError as exc:
-        await status_msg.edit_text(f"❌ **Error:** {exc}")
+        await _safe_edit(status_msg, f"❌ **Error:** {exc}")
         return
     except Exception as exc:
         LOG.exception("Unexpected error in /playforce for %s", chat_id)
-        await status_msg.edit_text(
+        await _safe_edit(
+            status_msg,
             f"❌ কিছু একটা সমস্যা হয়েছে।\n"
-            f"**Details:** `{type(exc).__name__}: {str(exc)[:200]}`"
+            f"**Details:** `{type(exc).__name__}: {str(exc)[:200]}`",
         )
         return
 
@@ -805,23 +846,38 @@ async def playforce_command(client: Client, message: Message):
             thumbnail=thumbnail, requester=requester,
         )
     except FileNotFoundError:
-        await status_msg.edit_text(
+        await _safe_edit(
+            status_msg,
             "❌ মিডিয়া ফাইল/URL পাওয়া যায়নি।\n"
-            "আবার `/playforce` দিয়ে চেষ্টা করুন।"
+            "আবার `/playforce` দিয়ে চেষ্টা করুন।",
         )
+        try:
+            await leave_voice_chat(chat_id)
+        except Exception:
+            pass
         return
     except RuntimeError as exc:
-        await status_msg.edit_text(
-            f"❌ {exc}\n\nSTRING_SESSION সেট করা আছে কিনা চেক করুন।"
+        await _safe_edit(
+            status_msg,
+            f"❌ {exc}\n\nSTRING_SESSION সেট করা আছে কিনা চেক করুন।",
         )
+        try:
+            await leave_voice_chat(chat_id)
+        except Exception:
+            pass
         return
     except Exception as exc:
         LOG.exception("Stream start failed in /playforce %s", chat_id)
-        await status_msg.edit_text(
+        await _safe_edit(
+            status_msg,
             "❌ Voice chat-এ connect করা যাচ্ছে না।\n"
             "নিশ্চিত করুন voice chat চালু আছে।\n\n"
-            f"**Error:** `{type(exc).__name__}: {str(exc)[:150]}`"
+            f"**Error:** `{type(exc).__name__}: {str(exc)[:150]}`",
         )
+        try:
+            await leave_voice_chat(chat_id)
+        except Exception:
+            pass
         return
 
     # Start the progress timer

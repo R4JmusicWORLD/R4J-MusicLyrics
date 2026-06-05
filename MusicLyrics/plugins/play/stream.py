@@ -797,6 +797,24 @@ async def _do_play(chat_id: int, stream):
         if await _try_play():
             return
 
+    # All play methods failed — ensure we drop the chat from active state so
+    # the next play attempt does NOT think we are still connected (which would
+    # cause suppress_next_stream_end to swallow the new track's start event
+    # and wedge the bot forever).  Also try a best-effort leave so the VC is
+    # not left in a half-joined state.
+    _active_chats.discard(chat_id)
+    _suppress_stream_end.pop(chat_id, None)
+    if pytgcalls is not None:
+        for method_name in ("leave_call", "leave_group_call"):
+            fn = getattr(pytgcalls, method_name, None)
+            if fn is None:
+                continue
+            try:
+                await asyncio.wait_for(fn(chat_id), timeout=5.0)
+                break
+            except Exception:
+                continue
+
     raise RuntimeError(f"All play methods failed for chat {chat_id}")
 
 

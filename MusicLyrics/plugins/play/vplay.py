@@ -32,6 +32,7 @@ from MusicLyrics.plugins.play.stream import (
     stream_video,
     is_active,
     pre_join_vc,
+    leave_voice_chat,
     _now_playing_messages,
     _control_keyboard,
     _queue_added_keyboard,
@@ -40,6 +41,30 @@ from MusicLyrics.plugins.play.stream import (
     _start_progress_timer,
     _add_reaction,
 )
+
+
+async def _safe_edit(msg, text: str, **kwargs) -> bool:
+    """Edit a status message, silently ignoring deleted/expired messages.
+
+    Without this, MessageIdInvalid raised inside an error handler bubbles
+    up as an unhandled exception and freezes the dispatcher.
+    """
+    if msg is None:
+        return False
+    try:
+        await msg.edit_text(text, **kwargs)
+        return True
+    except Exception:
+        try:
+            # Best-effort: send a new message in the same chat
+            chat_obj = getattr(msg, "chat", None)
+            chat_id = getattr(chat_obj, "id", None) if chat_obj else None
+            if chat_id is not None:
+                await bot.send_message(chat_id, text, **kwargs)
+                return True
+        except Exception:
+            pass
+        return False
 from MusicLyrics.plugins.play.prefetch import prefetch_next, mark_resolved
 from MusicLyrics.plugins.play.platforms.youtube import (
     search_youtube,
@@ -454,13 +479,14 @@ async def vplay_command(client: Client, message: Message):
             except Exception:
                 pass
     except ValueError as exc:
-        await status_msg.edit_text(f"❌ **Error:** {exc}")
+        await _safe_edit(status_msg, f"❌ **Error:** {exc}")
         return
     except Exception as exc:
         LOG.exception("Unexpected error in /vplay for %s", chat_id)
-        await status_msg.edit_text(
+        await _safe_edit(
+            status_msg,
             f"❌ কিছু একটা সমস্যা হয়েছে। পরে আবার চেষ্টা করুন।\n"
-            f"**Details:** `{type(exc).__name__}: {str(exc)[:200]}`"
+            f"**Details:** `{type(exc).__name__}: {str(exc)[:200]}`",
         )
         return
 
@@ -511,25 +537,41 @@ async def vplay_command(client: Client, message: Message):
         )
     except FileNotFoundError:
         LOG.exception("Media not found for video stream in %s", chat_id)
-        await status_msg.edit_text(
+        await _safe_edit(
+            status_msg,
             "❌ ভিডিও ফাইল/URL পাওয়া যায়নি।\n"
-            "আবার `/vplay` দিয়ে চেষ্টা করুন।"
+            "আবার `/vplay` দিয়ে চেষ্টা করুন।",
         )
+        # No track is playing — leave VC so the bot is not stuck half-joined
+        try:
+            await leave_voice_chat(chat_id)
+        except Exception:
+            pass
         return
     except RuntimeError as exc:
-        await status_msg.edit_text(
+        await _safe_edit(
+            status_msg,
             f"❌ {exc}\n\n"
-            "STRING_SESSION সেট করা আছে কিনা চেক করুন।"
+            "STRING_SESSION সেট করা আছে কিনা চেক করুন।",
         )
+        try:
+            await leave_voice_chat(chat_id)
+        except Exception:
+            pass
         return
     except Exception as exc:
         LOG.exception("Video stream start failed in %s", chat_id)
-        await status_msg.edit_text(
+        await _safe_edit(
+            status_msg,
             "❌ Voice chat-এ video stream করা যাচ্ছে না।\n"
             "নিশ্চিত করুন voice chat চালু আছে এবং "
             "assistant গ্রুপে আছে।\n\n"
-            f"**Error:** `{type(exc).__name__}: {str(exc)[:150]}`"
+            f"**Error:** `{type(exc).__name__}: {str(exc)[:150]}`",
         )
+        try:
+            await leave_voice_chat(chat_id)
+        except Exception:
+            pass
         return
 
     # Start progress timer for the video track
