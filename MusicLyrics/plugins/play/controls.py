@@ -44,6 +44,7 @@ from MusicLyrics.plugins.play.stream import (
     suppress_next_stream_end,
     _fresh_resolve_and_play,
 )
+from MusicLyrics.plugins.play.prefetch import prefetch_next
 from MusicLyrics.utils.autodelete import (
     auto_delete_service,
     auto_delete_playing,
@@ -131,6 +132,14 @@ async def skip_cmd(client: Client, message: Message):
 
             # Fresh-resolve media across platforms (YouTube first)
             success = await _fresh_resolve_and_play(chat_id, next_item)
+
+            # As soon as the new track starts, kick off prefetch for the
+            # following one so the next /skip is also instant.
+            try:
+                import asyncio as _aio
+                _aio.create_task(prefetch_next(chat_id))
+            except Exception:
+                pass
 
             # If this track failed, try up to 3 subsequent tracks
             if not success:
@@ -449,6 +458,14 @@ async def cb_skip(client: Client, callback: CallbackQuery):
 
             # Fresh-resolve media across platforms (YouTube first)
             success = await _fresh_resolve_and_play(chat_id, next_item)
+
+            # As soon as the new track starts, kick off prefetch for the
+            # following one so the next /skip is also instant.
+            try:
+                import asyncio as _aio
+                _aio.create_task(prefetch_next(chat_id))
+            except Exception:
+                pass
 
             # If this track failed, try up to 3 subsequent tracks
             if not success:

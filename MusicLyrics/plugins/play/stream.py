@@ -70,21 +70,50 @@ _last_successful_platform: dict[int, str] = {}
 # Per-chat lock to prevent race conditions between auto-next and manual skip/stop
 _skip_locks: dict[int, asyncio.Lock] = {}
 
-# Counter to suppress stream-end events caused by manual skip/stop replacing streams.
-# When _do_play replaces the current stream, py-tgcalls fires StreamAudioEnded for the
-# OLD stream.  Without suppression this causes _on_stream_end to double-advance the
-# queue and leave the VC.
-_suppress_stream_end: dict[int, int] = {}
+# TTL-based suppression for stream-end events caused by manual skip/stop
+# replacing streams.  When _do_play replaces the current stream, py-tgcalls
+# fires StreamAudioEnded for the OLD stream.  Without suppression this causes
+# _on_stream_end to double-advance the queue and leave the VC.
+#
+# We use a list of expiry timestamps per chat instead of a raw counter so
+# stale suppressions cannot accumulate and silently swallow REAL stream-end
+# events (which would cause "bot stuck in VC" symptoms).
+_suppress_stream_end: dict[int, list[float]] = {}
+_SUPPRESS_TTL_SEC = 8.0  # window in which a replacing play() should fire its old-stream-end event
 
 
 def suppress_next_stream_end(chat_id: int) -> None:
-    """Tell _on_stream_end to ignore the next N stream-end events for *chat_id*.
+    """Tell _on_stream_end to ignore the next stream-end event for *chat_id*.
 
     Call this BEFORE _do_play when you are intentionally replacing the current
     stream (skip / force-play) so the old stream's end event is swallowed.
+
+    Each suppression has a TTL — if the old-stream-end never arrives within
+    that window we forget about it so future real events are NOT swallowed.
     """
-    _suppress_stream_end[chat_id] = _suppress_stream_end.get(chat_id, 0) + 1
-    LOG.debug("suppress_next_stream_end(%s) → count=%d", chat_id, _suppress_stream_end[chat_id])
+    deadlines = _suppress_stream_end.setdefault(chat_id, [])
+    now = time.time()
+    # Drop any expired entries first
+    deadlines[:] = [d for d in deadlines if d > now]
+    deadlines.append(now + _SUPPRESS_TTL_SEC)
+    LOG.debug("suppress_next_stream_end(%s) → pending=%d", chat_id, len(deadlines))
+
+
+def _consume_suppression(chat_id: int) -> bool:
+    """If there is a non-expired suppression, consume one and return True."""
+    deadlines = _suppress_stream_end.get(chat_id)
+    if not deadlines:
+        return False
+    now = time.time()
+    # Drop expired
+    deadlines[:] = [d for d in deadlines if d > now]
+    if not deadlines:
+        _suppress_stream_end.pop(chat_id, None)
+        return False
+    deadlines.pop(0)
+    if not deadlines:
+        _suppress_stream_end.pop(chat_id, None)
+    return True
 
 
 def _get_skip_lock(chat_id: int) -> asyncio.Lock:
@@ -438,7 +467,7 @@ async def _check_stream_url(url: str) -> bool:
     """Quick HEAD check to see if a stream URL is still valid.
 
     Returns True if URL is reachable (2xx/3xx), False otherwise.
-    SPEED OPTIMISED: 1.5s timeout, HEAD-only, assume OK on timeout.
+    SPEED OPTIMISED: 0.6s timeout, HEAD-only, assume OK on timeout.
     """
     if not _is_url(url):
         return True  # Not a URL, skip check
@@ -448,7 +477,7 @@ async def _check_stream_url(url: str) -> bool:
             try:
                 async with session.head(
                     url,
-                    timeout=aiohttp.ClientTimeout(total=1.2, connect=0.8),
+                    timeout=aiohttp.ClientTimeout(total=0.6, connect=0.4),
                     allow_redirects=True,
                 ) as resp:
                     if resp.status < 400:
@@ -692,7 +721,7 @@ async def _do_play(chat_id: int, stream):
             LOG.debug("Bot add_chat_members failed: %s", e4)
 
     if joined:
-        await asyncio.sleep(0.3)  # Brief pause for Telegram to register the join
+        await asyncio.sleep(0.2)  # Brief pause for Telegram to register the join
         if await _try_play():
             return
 
@@ -821,19 +850,23 @@ async def stream_audio(
     duration: int = 0,
     thumbnail: str = "",
     requester: str = "",
+    skip_url_check: bool = False,
 ) -> None:
     """Join voice chat (if needed) and start audio stream.
 
     media_path can be a local file path or a direct stream URL.
     If streaming a URL fails, automatically downloads the file
     and retries with the local path.
+
+    skip_url_check=True bypasses the 0.6 s HEAD probe — pass True for
+    freshly-resolved / prefetched URLs to make /skip near-instant.
     """
     if pytgcalls is None:
         raise RuntimeError("Music streaming is disabled -- STRING_SESSION not configured.")
     _validate_media(media_path)
 
     # Pre-check stream URL validity to prevent ffprobe/JSONDecodeError crashes
-    if _is_url(media_path):
+    if _is_url(media_path) and not skip_url_check:
         url_ok = await _check_stream_url(media_path)
         if not url_ok:
             LOG.warning("Stream URL pre-check failed in %s — trying download fallbacks concurrently", chat_id)
@@ -1001,19 +1034,23 @@ async def stream_video(
     duration: int = 0,
     thumbnail: str = "",
     requester: str = "",
+    skip_url_check: bool = False,
 ) -> None:
     """Join voice chat (if needed) and start video stream.
 
     media_path can be a local file path or a direct stream URL.
     If streaming a URL fails, automatically downloads the file
     and retries with the local path.
+
+    skip_url_check=True bypasses the 0.6 s HEAD probe — pass True for
+    freshly-resolved / prefetched URLs to make /skip near-instant.
     """
     if pytgcalls is None:
         raise RuntimeError("Music streaming is disabled -- STRING_SESSION not configured.")
     _validate_media(media_path)
 
     # Pre-check stream URL validity to prevent ffprobe/JSONDecodeError crashes
-    if _is_url(media_path):
+    if _is_url(media_path) and not skip_url_check:
         url_ok = await _check_stream_url(media_path)
         if not url_ok:
             LOG.warning("Video stream URL pre-check failed in %s — going directly to fallback", chat_id)
@@ -1227,7 +1264,7 @@ async def leave_voice_chat(chat_id: int) -> None:
             if left:
                 break
             if attempt < 2:
-                await asyncio.sleep(0.5)
+                await asyncio.sleep(0.25)
 
     if not left:
         LOG.error(
@@ -1284,11 +1321,13 @@ async def _fresh_resolve_and_play(chat_id: int, item) -> bool:
                 await stream_video(
                     chat_id, item.media_path,
                     title=item.title, duration=item.duration,
+                    skip_url_check=True,
                 )
             else:
                 await stream_audio(
                     chat_id, item.media_path,
                     title=item.title, duration=item.duration,
+                    skip_url_check=True,
                 )
             return True
         except Exception as fast_exc:
@@ -1410,9 +1449,9 @@ async def _fresh_resolve_and_play(chat_id: int, item) -> bool:
     item.is_stream_url = fresh_is_stream
 
     if item.stream_type == "video":
-        await stream_video(chat_id, item.media_path, title=item.title, duration=item.duration)
+        await stream_video(chat_id, item.media_path, title=item.title, duration=item.duration, skip_url_check=True)
     else:
-        await stream_audio(chat_id, item.media_path, title=item.title, duration=item.duration)
+        await stream_audio(chat_id, item.media_path, title=item.title, duration=item.duration, skip_url_check=True)
 
     return True
 
@@ -1471,14 +1510,12 @@ async def _on_stream_end(client, update):
 
     # Suppress events caused by manual skip/stop replacing the current stream.
     # _do_play triggers StreamAudioEnded for the OLD stream — swallow it here.
-    if _suppress_stream_end.get(chat_id, 0) > 0:
-        _suppress_stream_end[chat_id] -= 1
-        LOG.info("Suppressed stream-end event for %s (remaining suppresses=%d)",
-                 chat_id, _suppress_stream_end[chat_id])
+    if _consume_suppression(chat_id):
+        LOG.info("Suppressed stream-end event for %s (TTL-based)", chat_id)
         return
 
     # This is a REAL stream-end (track finished naturally).
-    # Reset the suppress counter to 0 so no stale suppressions remain.
+    # Defensive: clear any stale suppression bucket so no future event is swallowed.
     _suppress_stream_end.pop(chat_id, None)
 
     # Prevent double-processing: if auto-next is already running for this chat, skip
@@ -1548,6 +1585,12 @@ async def _on_stream_end(client, update):
 
             try:
                 success = await _fresh_resolve_and_play(chat_id, next_item)
+                # Kick off prefetch for the FOLLOWING item so the next
+                # auto-next / skip is also instant.
+                try:
+                    asyncio.create_task(prefetch_next(chat_id))
+                except Exception:
+                    pass
                 if not success:
                     # Try skipping to subsequent tracks before giving up
                     LOG.warning("Auto-next failed for '%s', trying next tracks in queue", next_item.title)
@@ -1754,9 +1797,9 @@ if pytgcalls is not None:
           (safety cap — prevents the bot sitting forever in VC if the
           stream-end event never fires for HLS / live URLs).
         """
-        UNKNOWN_DURATION_CAP_SEC = 15 * 60  # 15 minutes hard ceiling
+        UNKNOWN_DURATION_CAP_SEC = 8 * 60  # 8 minutes hard ceiling
         while True:
-            await asyncio.sleep(5)  # Check every 5 seconds
+            await asyncio.sleep(3)  # Check every 3 seconds
             try:
                 # Import locally to avoid circular import at module load
                 from MusicLyrics.plugins.play.queue import get_chat_queue as _gcq
@@ -1790,7 +1833,7 @@ if pytgcalls is not None:
     async def _vc_orphan_reaper():
         from MusicLyrics.plugins.play.queue import get_chat_queue as _gcq
         while True:
-            await asyncio.sleep(15)
+            await asyncio.sleep(5)
             try:
                 # Build a union: chats we *think* are active + chats pytgcalls
                 # thinks are active.  This catches drift in either direction.

@@ -210,6 +210,8 @@ async def prefetch_next(chat_id: int) -> None:
     """Kick off a background task to prefetch the NEXT item in *chat_id*'s queue.
 
     Safe to call repeatedly — cancels any previous prefetch for the chat first.
+    Also fires a lower-priority prefetch for the item AFTER the next one so
+    rapid /skip-spam stays instant.
     """
     old = _prefetch_tasks.pop(chat_id, None)
     if old and not old.done():
@@ -231,21 +233,35 @@ async def prefetch_next(chat_id: int) -> None:
                 LOG.info(
                     "Prefetch HIT (local file) for %s: '%s'", chat_id, next_item.title
                 )
-                return
-            LOG.info("Prefetch START for %s: '%s'", chat_id, next_item.title)
-            ok = await _resolve_item_media(next_item)
-            if ok:
-                LOG.info(
-                    "Prefetch DONE for %s: '%s' -> %s%s",
-                    chat_id, next_item.title,
-                    "URL " if next_item.is_stream_url else "FILE ",
-                    str(next_item.media_path)[:80],
-                )
             else:
-                LOG.warning(
-                    "Prefetch MISS for %s: '%s' — will resolve at play time",
-                    chat_id, next_item.title,
-                )
+                LOG.info("Prefetch START for %s: '%s'", chat_id, next_item.title)
+                ok = await _resolve_item_media(next_item)
+                if ok:
+                    LOG.info(
+                        "Prefetch DONE for %s: '%s' -> %s%s",
+                        chat_id, next_item.title,
+                        "URL " if next_item.is_stream_url else "FILE ",
+                        str(next_item.media_path)[:80],
+                    )
+                else:
+                    LOG.warning(
+                        "Prefetch MISS for %s: '%s' — will resolve at play time",
+                        chat_id, next_item.title,
+                    )
+
+            # Also prefetch queue[2] so rapid skipping stays fast.
+            cq2 = await get_chat_queue(chat_id)
+            if len(cq2.items) < 3:
+                return
+            second_item = cq2.items[2]
+            if is_prefetched(second_item) and not second_item.media_path.startswith(("http://", "https://")):
+                return
+            try:
+                await _resolve_item_media(second_item)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                pass
         except asyncio.CancelledError:
             pass
         except Exception as e:
