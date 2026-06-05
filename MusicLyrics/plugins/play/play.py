@@ -43,6 +43,7 @@ from MusicLyrics.plugins.play.stream import (
     leave_voice_chat,
     _get_skip_lock,
 )
+from MusicLyrics.plugins.play.prefetch import prefetch_next
 from MusicLyrics.plugins.play.platforms.youtube import (
     search_youtube,
     get_audio_stream_url,
@@ -606,6 +607,11 @@ async def play_command(client: Client, message: Message):
 
     # If something is already playing, just queue it
     if position > 1 and is_active(chat_id):
+        # Kick off prefetch so this item is ready instantly when it's its turn
+        try:
+            asyncio.create_task(prefetch_next(chat_id))
+        except Exception:
+            pass
         dur = format_duration(duration)
         color = _get_next_color()
         await status_msg.edit_text(

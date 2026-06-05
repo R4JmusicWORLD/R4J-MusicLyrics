@@ -40,6 +40,11 @@ from MusicLyrics.plugins.play.platforms.soundcloud import (
 from MusicLyrics.plugins.play.platforms.jiosaavn import (
     search_and_download_jiosaavn,
 )
+from MusicLyrics.plugins.play.prefetch import (
+    prefetch_next,
+    cancel_prefetch,
+    is_prefetched,
+)
 
 LOG = logging.getLogger(__name__)
 
@@ -907,6 +912,11 @@ async def stream_audio(
             _last_successful_platform[chat_id] = "soundcloud"
         elif "jiosaavn" in media_path.lower() or "saavn" in media_path.lower():
             _last_successful_platform[chat_id] = "jiosaavn"
+        # Kick off prefetch for the NEXT queue item — makes skip/auto-next instant
+        try:
+            asyncio.create_task(prefetch_next(chat_id))
+        except Exception:
+            pass
     except Exception as exc:
         # If stream URL failed, try all fallback sources CONCURRENTLY
         if _is_url(media_path) and title:
@@ -1039,6 +1049,11 @@ async def stream_video(
         _active_chats.add(chat_id)
         LOG.info("Streaming video in %s: %s (%s)",
                  chat_id, title, media_path[:100])
+        # Kick off prefetch for the NEXT queue item — makes skip/auto-next instant
+        try:
+            asyncio.create_task(prefetch_next(chat_id))
+        except Exception:
+            pass
     except Exception as exc:
         # If stream URL failed, try downloading and playing local file
         if _is_url(media_path):
@@ -1164,8 +1179,12 @@ async def set_volume(chat_id: int, volume: int) -> bool:
 
 async def leave_voice_chat(chat_id: int) -> None:
     """Leave the voice chat and clean up."""
-    # Stop progress timer
+    # Stop progress timer & cancel any pending prefetch immediately
     _stop_progress_timer(chat_id)
+    try:
+        cancel_prefetch(chat_id)
+    except Exception:
+        pass
 
     # Try leaving with retries — try BOTH methods on each attempt
     left = False
@@ -1236,6 +1255,37 @@ async def _fresh_resolve_and_play(chat_id: int, item) -> bool:
     sending UI messages (Now Playing / error).
     """
     import os as _os
+
+    # ── FAST PATH: use prefetched / initially resolved media if still valid ──
+    # This is what makes /skip and auto-next feel instant: when the next item
+    # already has a usable media_path (either set during the original /play
+    # resolve, or by the background prefetcher), we go straight to streaming
+    # instead of re-running search+download.
+    if is_prefetched(item):
+        try:
+            LOG.info(
+                "fresh_resolve FAST PATH for %s: using existing media for '%s'",
+                chat_id, item.title,
+            )
+            if item.stream_type == "video":
+                await stream_video(
+                    chat_id, item.media_path,
+                    title=item.title, duration=item.duration,
+                )
+            else:
+                await stream_audio(
+                    chat_id, item.media_path,
+                    title=item.title, duration=item.duration,
+                )
+            return True
+        except Exception as fast_exc:
+            LOG.warning(
+                "FAST PATH failed for '%s' (%s) — falling back to full resolve",
+                item.title, fast_exc,
+            )
+            # Force re-resolve below
+            item.media_path = ""
+            item.is_stream_url = False
 
     fresh_path = None
     fresh_is_stream = False
@@ -1683,24 +1733,66 @@ if pytgcalls is not None:
     # that case the bot stays in VC forever.  This timer catches those
     # cases and triggers auto-next or leave after duration + buffer.
     async def _fallback_stream_end_checker():
-        """Periodically check if tracks have finished playing."""
+        """Periodically check if tracks have finished playing.
+
+        Triggers _on_stream_end when:
+        * a track has been playing past its duration + 10 s buffer, OR
+        * a track with unknown duration (0) has been playing for > 15 min
+          (safety cap — prevents the bot sitting forever in VC if the
+          stream-end event never fires for HLS / live URLs).
+        """
+        UNKNOWN_DURATION_CAP_SEC = 15 * 60  # 15 minutes hard ceiling
         while True:
             await asyncio.sleep(5)  # Check every 5 seconds
             try:
+                # Import locally to avoid circular import at module load
+                from MusicLyrics.plugins.play.queue import get_chat_queue as _gcq
                 for chat_id in list(_active_chats):
-                    if chat_id not in _play_start_times or chat_id not in _play_durations:
+                    if chat_id not in _play_start_times:
                         continue
                     elapsed = time.time() - _play_start_times[chat_id]
-                    duration = _play_durations[chat_id]
-                    # If track has been playing for longer than its duration + 10s buffer
+                    duration = _play_durations.get(chat_id, 0) or 0
                     if duration > 0 and elapsed > duration + 10:
-                        LOG.info("Fallback timer detected stream end for %s (elapsed=%.0f, duration=%d)",
-                                 chat_id, elapsed, duration)
+                        LOG.info(
+                            "Fallback timer: end-of-track for %s (elapsed=%.0f, duration=%d)",
+                            chat_id, elapsed, duration,
+                        )
+                        await _on_stream_end(None, chat_id)
+                    elif duration <= 0 and elapsed > UNKNOWN_DURATION_CAP_SEC:
+                        LOG.warning(
+                            "Fallback timer: unknown-duration safety cap hit for %s (elapsed=%.0f)",
+                            chat_id, elapsed,
+                        )
                         await _on_stream_end(None, chat_id)
             except Exception as e:
                 LOG.debug("Fallback stream-end checker error: %s", e)
 
     asyncio.get_event_loop().create_task(_fallback_stream_end_checker())
+
+    # ── Safety net: periodically ensure we have not been left sitting in VC ──
+    # If _active_chats holds a chat but its queue is empty AND no progress
+    # timer is running (no track playing), force a leave.  Catches the rare
+    # edge case where stream-end fired but leave_voice_chat raised mid-way.
+    async def _vc_orphan_reaper():
+        from MusicLyrics.plugins.play.queue import get_chat_queue as _gcq
+        while True:
+            await asyncio.sleep(15)
+            try:
+                for chat_id in list(_active_chats):
+                    cq = await _gcq(chat_id)
+                    if not cq.items and chat_id not in _play_start_times:
+                        LOG.warning(
+                            "VC orphan detected for %s — queue empty and no playback; leaving",
+                            chat_id,
+                        )
+                        try:
+                            await leave_voice_chat(chat_id)
+                        except Exception as le:
+                            LOG.debug("Orphan leave failed for %s: %s", chat_id, le)
+            except Exception as e:
+                LOG.debug("VC orphan reaper error: %s", e)
+
+    asyncio.get_event_loop().create_task(_vc_orphan_reaper())
 
     # ── ALSO register on_kicked / on_left to clean up ──
     try:

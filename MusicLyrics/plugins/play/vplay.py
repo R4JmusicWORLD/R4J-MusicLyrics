@@ -39,6 +39,7 @@ from MusicLyrics.plugins.play.stream import (
     _start_progress_timer,
     _add_reaction,
 )
+from MusicLyrics.plugins.play.prefetch import prefetch_next
 from MusicLyrics.plugins.play.platforms.youtube import (
     search_youtube,
     get_video_stream_url,
@@ -484,6 +485,10 @@ async def vplay_command(client: Client, message: Message):
     position = await add_to_queue(chat_id, item)
 
     if position > 1 and is_active(chat_id):
+        try:
+            asyncio.create_task(prefetch_next(chat_id))
+        except Exception:
+            pass
         dur = format_duration(duration)
         color = _get_next_color()
         await status_msg.edit_text(
@@ -565,3 +570,4 @@ async def vplay_command(client: Client, message: Message):
         if chat_id not in _now_playing_messages:
             _now_playing_messages[chat_id] = []
         _now_playing_messages[chat_id].append(status_msg)
+        await _add_reaction(chat_id, message.id)
