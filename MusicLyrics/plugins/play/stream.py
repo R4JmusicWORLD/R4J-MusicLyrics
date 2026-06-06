@@ -79,7 +79,12 @@ _skip_locks: dict[int, asyncio.Lock] = {}
 # stale suppressions cannot accumulate and silently swallow REAL stream-end
 # events (which would cause "bot stuck in VC" symptoms).
 _suppress_stream_end: dict[int, list[float]] = {}
-_SUPPRESS_TTL_SEC = 8.0  # window in which a replacing play() should fire its old-stream-end event
+# Extended TTL: a slow pytgcalls.play() replacing the stream can take up to
+# ~25 s in the worst case (3 methods × ~8 s).  The old 8 s window was too
+# short — the OLD stream's end-event arrived AFTER expiry, was treated as a
+# REAL end, and auto-next either fired twice or fired against a healthy new
+# stream, producing the "skip got stuck / next song not playing" symptoms.
+_SUPPRESS_TTL_SEC = 45.0
 
 
 def suppress_next_stream_end(chat_id: int) -> None:
@@ -669,7 +674,18 @@ async def _do_play(chat_id: int, stream):
     """Call pytgcalls.play — join VC if needed, then start streaming.
 
     Compatible with py-tgcalls 2.1.x and 2.2.x APIs.
-    If the assistant isn't in the group yet, tries to auto-join first.
+    Single fast attempt per method.  On total failure performs a hard
+    reset (raw-API leave) so the next call starts from a clean state
+    instead of inheriting a wedged pytgcalls connection.
+
+    The total wall-clock budget is bounded:
+        3 methods × PLAY_METHOD_TIMEOUT (5s) + auto-join + 1 retry
+        ≤ ~22 s in the worst case.
+
+    Callers wrap _do_play with their own outer ``asyncio.wait_for`` —
+    keep that outer timeout STRICTLY greater than this budget (>= 30s)
+    or pytgcalls will be cancelled mid-``play()`` and left wedged for
+    the next track.
     """
     if pytgcalls is None:
         raise RuntimeError("Music streaming is disabled -- STRING_SESSION not configured.")
@@ -680,17 +696,10 @@ async def _do_play(chat_id: int, stream):
     if chat_id in _active_chats:
         suppress_next_stream_end(chat_id)
 
-    # Per-method hard timeout — pytgcalls.play() has been observed to hang
-    # forever on flaky networks / dropped assistant connections.  Without
-    # this timeout the caller's skip-lock would never be released and EVERY
-    # subsequent music command would deadlock.
-    #
-    # Keep this short: skip / auto-next must feel snappy.  3 methods × 6 s
-    # = 18 s worst-case for a single attempt, ~36 s including the auto-join
-    # retry pass.  Real Telegram play() either responds in <2 s or is
-    # already hung on a stale call — waiting longer just makes the user
-    # think the bot is dead.
-    PLAY_METHOD_TIMEOUT = 6.0
+    # Per-method hard timeout.  5 s is enough for a healthy play() to
+    # respond — a slower response almost always means the call is wedged
+    # and the next method/reset will work better than waiting longer.
+    PLAY_METHOD_TIMEOUT = 5.0
 
     async def _reset_call_state():
         """Leave the call to clear py-tgcalls internal state.
@@ -698,20 +707,34 @@ async def _do_play(chat_id: int, stream):
         When pytgcalls.play() hangs on a track replacement, retrying the
         same call usually hangs too because py-tgcalls' internal stream
         state is wedged.  A fresh leave+rejoin almost always unblocks it.
+
+        We try BOTH pytgcalls leave methods AND the raw API leave so a
+        wedged pytgcalls connection cannot keep us stuck in the call.
         """
         for method_name in ("leave_call", "leave_group_call"):
             fn = getattr(pytgcalls, method_name, None)
             if fn is None:
                 continue
             try:
-                await asyncio.wait_for(fn(chat_id), timeout=3.0)
+                await asyncio.wait_for(fn(chat_id), timeout=2.5)
                 LOG.info("_reset_call_state: %s succeeded for %s", method_name, chat_id)
                 return
             except Exception as e:
                 LOG.debug("_reset_call_state: %s failed for %s: %s", method_name, chat_id, e)
+        # pytgcalls leaves failed — try raw API so we definitely leave.
+        try:
+            await _raw_leave_group_call(chat_id)
+        except Exception as e:
+            LOG.debug("_reset_call_state: raw leave failed for %s: %s", chat_id, e)
 
     async def _try_play(reset_first: bool = False):
-        """Attempt all play methods — returns True on success."""
+        """Attempt all play methods — returns True on success.
+
+        Once any method TIMES OUT we immediately reset and break out so
+        the remaining methods don't pile up on a wedged call.  Other
+        exceptions (TypeError / AttributeError from older pytgcalls) are
+        non-fatal and fall through to the next method.
+        """
         if reset_first:
             await _reset_call_state()
             _active_chats.discard(chat_id)
@@ -732,13 +755,13 @@ async def _do_play(chat_id: int, stream):
                 LOG.info("play() with GroupCallConfig succeeded for %s", chat_id)
                 return True
             except asyncio.TimeoutError:
-                LOG.warning("play() with GroupCallConfig TIMED OUT for %s", chat_id)
-                # If the call is wedged, methods 2/3 will hang too — reset now.
-                await _reset_call_state()
-                _active_chats.discard(chat_id)
-                await asyncio.sleep(0.2)
+                LOG.warning("play() with GroupCallConfig TIMED OUT for %s — aborting attempt", chat_id)
+                return False
             except (TypeError, AttributeError) as e:
-                LOG.debug("play() with GroupCallConfig failed: %s", e)
+                LOG.debug("play() with GroupCallConfig API mismatch: %s — trying plain play()", e)
+            except Exception as e:
+                # Unknown error — log and let the next method try.
+                LOG.debug("play() with GroupCallConfig errored: %s", e)
 
         # Method 2: plain play() (py-tgcalls 2.2.x)
         try:
@@ -750,10 +773,8 @@ async def _do_play(chat_id: int, stream):
             LOG.info("play() succeeded for %s", chat_id)
             return True
         except asyncio.TimeoutError:
-            LOG.warning("plain play() TIMED OUT for %s", chat_id)
-            await _reset_call_state()
-            _active_chats.discard(chat_id)
-            await asyncio.sleep(0.2)
+            LOG.warning("plain play() TIMED OUT for %s — aborting attempt", chat_id)
+            return False
         except Exception as e:
             LOG.debug("play() failed: %s", e)
 
@@ -790,7 +811,7 @@ async def _do_play(chat_id: int, stream):
 
     # Method 1: Direct join by chat_id
     try:
-        await userbot.join_chat(chat_id)
+        await asyncio.wait_for(userbot.join_chat(chat_id), timeout=8.0)
         joined = True
         LOG.info("Assistant auto-joined group %s by chat ID", chat_id)
     except Exception as e:
@@ -799,9 +820,11 @@ async def _do_play(chat_id: int, stream):
     # Method 2: Bot creates invite link → assistant joins
     if not joined:
         try:
-            invite_link = await bot.export_chat_invite_link(chat_id)
+            invite_link = await asyncio.wait_for(
+                bot.export_chat_invite_link(chat_id), timeout=5.0,
+            )
             if invite_link:
-                await userbot.join_chat(invite_link)
+                await asyncio.wait_for(userbot.join_chat(invite_link), timeout=8.0)
                 joined = True
                 LOG.info("Assistant auto-joined group %s via invite link", chat_id)
         except Exception as e2:
@@ -810,11 +833,16 @@ async def _do_play(chat_id: int, stream):
     # Method 3: Bot creates fresh one-time invite link → assistant joins
     if not joined:
         try:
-            new_link = await bot.create_chat_invite_link(
-                chat_id, name="Auto-Join", member_limit=1
+            new_link = await asyncio.wait_for(
+                bot.create_chat_invite_link(
+                    chat_id, name="Auto-Join", member_limit=1,
+                ),
+                timeout=5.0,
             )
             if new_link and new_link.invite_link:
-                await userbot.join_chat(new_link.invite_link)
+                await asyncio.wait_for(
+                    userbot.join_chat(new_link.invite_link), timeout=8.0,
+                )
                 joined = True
                 LOG.info("Assistant auto-joined group %s via fresh invite link", chat_id)
                 try:
@@ -828,7 +856,9 @@ async def _do_play(chat_id: int, stream):
     if not joined:
         try:
             me = await userbot.get_me()
-            await bot.add_chat_members(chat_id, me.id)
+            await asyncio.wait_for(
+                bot.add_chat_members(chat_id, me.id), timeout=5.0,
+            )
             joined = True
             LOG.info("Bot added assistant %s to group %s directly", me.id, chat_id)
         except Exception as e4:
@@ -839,23 +869,15 @@ async def _do_play(chat_id: int, stream):
         if await _try_play():
             return
 
-    # All play methods failed — ensure we drop the chat from active state so
-    # the next play attempt does NOT think we are still connected (which would
-    # cause suppress_next_stream_end to swallow the new track's start event
-    # and wedge the bot forever).  Also try a best-effort leave so the VC is
-    # not left in a half-joined state.
+    # All play methods failed — HARD RESET so we never inherit a wedged
+    # pytgcalls connection on the next attempt.  This is the key fix that
+    # stops "skip pressed → next song doesn't play → bot stuck" loops.
     _active_chats.discard(chat_id)
     _suppress_stream_end.pop(chat_id, None)
-    if pytgcalls is not None:
-        for method_name in ("leave_call", "leave_group_call"):
-            fn = getattr(pytgcalls, method_name, None)
-            if fn is None:
-                continue
-            try:
-                await asyncio.wait_for(fn(chat_id), timeout=5.0)
-                break
-            except Exception:
-                continue
+    try:
+        await _reset_call_state()
+    except Exception:
+        pass
 
     raise RuntimeError(f"All play methods failed for chat {chat_id}")
 
@@ -1836,8 +1858,24 @@ async def _on_stream_end(client, update):
             finished_title = finished.title if finished else "Unknown"
             finished_requester = finished.requester if finished else ""
 
-            # Clean up the finished track's file (if it was a local download)
-            if finished and not finished.is_stream_url and finished.media_path:
+            # Determine next item FIRST so we can tell loop mode from advance.
+            next_item = await skip_queue(chat_id, force=False)
+
+            # Clean up the finished track's file ONLY if we're actually
+            # advancing to a different item.  In loop mode skip_queue
+            # returns the SAME item — deleting its file before replay
+            # would break the loop.
+            is_loop_replay = (
+                finished is not None
+                and next_item is not None
+                and finished is next_item
+            )
+            if (
+                finished
+                and not finished.is_stream_url
+                and finished.media_path
+                and not is_loop_replay
+            ):
                 cleanup(finished.media_path)
 
             # Delete previous "Now Playing" / thumbnail messages for this chat
@@ -1850,7 +1888,6 @@ async def _on_stream_end(client, update):
                         pass
                 _now_playing_messages[chat_id].clear()
 
-            next_item = await skip_queue(chat_id, force=False)
             if next_item is None:
                 # Queue is empty — send "song ended" message with add-to-group button
                 try:
@@ -1882,7 +1919,7 @@ async def _on_stream_end(client, update):
                 try:
                     success = await asyncio.wait_for(
                         _fresh_resolve_and_play(chat_id, next_item),
-                        timeout=15.0,
+                        timeout=35.0,
                     )
                 except asyncio.TimeoutError:
                     LOG.warning("Auto-next resolve+play TIMED OUT for %s", chat_id)
@@ -1894,24 +1931,21 @@ async def _on_stream_end(client, update):
                 except Exception:
                     pass
                 if not success:
-                    # Try skipping to subsequent tracks before giving up
-                    LOG.warning("Auto-next failed for '%s', trying next tracks in queue", next_item.title)
-                    retries = 0
-                    while retries < 3:
-                        retries += 1
-                        fallback_item = await skip_queue(chat_id, force=True)
-                        if fallback_item is None:
-                            break
+                    # Single fallback — multiple retries used to compound
+                    # timeouts and leave the bot unresponsive for over a
+                    # minute when one track failed.
+                    LOG.warning("Auto-next failed for '%s', trying ONE more track", next_item.title)
+                    fallback_item = await skip_queue(chat_id, force=True)
+                    if fallback_item is not None:
                         try:
                             success = await asyncio.wait_for(
                                 _fresh_resolve_and_play(chat_id, fallback_item),
-                                timeout=15.0,
+                                timeout=35.0,
                             )
                             if success:
                                 next_item = fallback_item
-                                break
                         except Exception:
-                            continue
+                            success = False
 
                     if not success:
                         try:

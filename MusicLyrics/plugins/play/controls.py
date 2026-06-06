@@ -176,11 +176,14 @@ async def skip_cmd(client: Client, message: Message):
 
             # Fresh-resolve media across platforms (YouTube first).
             # Wrapped with timeout so a wedged resolve cannot freeze the
-            # chat — on timeout we fail fast and the caller can try again.
+            # chat.  35 s gives _do_play room to complete a hard reset
+            # + retry (~22 s worst case) plus a couple of platform
+            # download attempts.  Shorter timeouts here used to cancel
+            # pytgcalls.play() mid-call, leaving it wedged.
             try:
                 success = await asyncio.wait_for(
                     _fresh_resolve_and_play(chat_id, next_item),
-                    timeout=15.0,
+                    timeout=35.0,
                 )
             except asyncio.TimeoutError:
                 LOG.warning("Skip resolve+play TIMED OUT for %s", chat_id)
@@ -194,24 +197,21 @@ async def skip_cmd(client: Client, message: Message):
             except Exception:
                 pass
 
-            # If this track failed, try up to 3 subsequent tracks
+            # If this track failed, try ONE more track before giving up.
+            # Multiple retries used to compound timeouts and freeze the
+            # chat for a minute+ — single retry is enough.
             if not success:
-                retries = 0
-                while retries < 3:
-                    retries += 1
-                    fallback_item = await skip_queue(chat_id, force=True)
-                    if fallback_item is None:
-                        break
+                fallback_item = await skip_queue(chat_id, force=True)
+                if fallback_item is not None:
                     try:
                         success = await asyncio.wait_for(
                             _fresh_resolve_and_play(chat_id, fallback_item),
-                            timeout=15.0,
+                            timeout=35.0,
                         )
                         if success:
                             next_item = fallback_item
-                            break
                     except Exception:
-                        continue
+                        success = False
 
             if not success:
                 await leave_voice_chat(chat_id)
@@ -536,11 +536,13 @@ async def cb_skip(client: Client, callback: CallbackQuery):
             # swallowed too, breaking auto-next / sequential playback.
 
             # Fresh-resolve media across platforms (YouTube first), guarded
-            # with a timeout so a wedged resolve cannot freeze the chat.
+            # with a 35 s timeout so a wedged resolve cannot freeze the chat
+            # while still leaving enough room for _do_play's worst-case
+            # hard-reset + retry path (~22 s).
             try:
                 success = await asyncio.wait_for(
                     _fresh_resolve_and_play(chat_id, next_item),
-                    timeout=15.0,
+                    timeout=35.0,
                 )
             except asyncio.TimeoutError:
                 LOG.warning("cb_skip resolve+play TIMED OUT for %s", chat_id)
@@ -554,24 +556,20 @@ async def cb_skip(client: Client, callback: CallbackQuery):
             except Exception:
                 pass
 
-            # If this track failed, try up to 3 subsequent tracks
+            # Single fallback attempt — multiple retries compounded
+            # timeouts and froze the chat for over a minute.
             if not success:
-                retries = 0
-                while retries < 3:
-                    retries += 1
-                    fallback_item = await skip_queue(chat_id, force=True)
-                    if fallback_item is None:
-                        break
+                fallback_item = await skip_queue(chat_id, force=True)
+                if fallback_item is not None:
                     try:
                         success = await asyncio.wait_for(
                             _fresh_resolve_and_play(chat_id, fallback_item),
-                            timeout=15.0,
+                            timeout=35.0,
                         )
                         if success:
                             next_item = fallback_item
-                            break
                     except Exception:
-                        continue
+                        success = False
 
             if not success:
                 try:
