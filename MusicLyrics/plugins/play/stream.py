@@ -1347,6 +1347,142 @@ async def set_volume(chat_id: int, volume: int) -> bool:
         return False
 
 
+async def _raw_leave_group_call(chat_id: int) -> bool:
+    """Last-ditch leave via Telegram raw API.
+
+    When pytgcalls' ``leave_call`` / ``leave_group_call`` keep timing out
+    (the most common cause of "bot says it left but is still in VC"), the
+    underlying GroupCall on Telegram's side has not actually been left.
+    Hitting ``phone.LeaveGroupCall`` directly through the userbot bypasses
+    pytgcalls' wedged state and forces the server to drop the participant.
+
+    Returns True on success.
+    """
+    if userbot is None:
+        return False
+    try:
+        from pyrogram.raw import functions, types as _raw_types  # noqa: F401
+    except Exception:
+        return False
+    try:
+        peer = await userbot.resolve_peer(chat_id)
+    except Exception as e:
+        LOG.debug("raw_leave: resolve_peer failed for %s: %s", chat_id, e)
+        return False
+
+    # Fetch the InputGroupCall — works for both basic groups and channels
+    input_call = None
+    try:
+        if hasattr(peer, "channel_id"):
+            full = await userbot.invoke(
+                functions.channels.GetFullChannel(channel=peer)
+            )
+            call = getattr(full.full_chat, "call", None)
+            if call is not None:
+                input_call = call
+        else:
+            full = await userbot.invoke(
+                functions.messages.GetFullChat(chat_id=peer.chat_id)
+            )
+            call = getattr(full.full_chat, "call", None)
+            if call is not None:
+                input_call = call
+    except Exception as e:
+        LOG.debug("raw_leave: GetFull*Chat failed for %s: %s", chat_id, e)
+        return False
+
+    if input_call is None:
+        LOG.debug("raw_leave: no active group call on %s", chat_id)
+        # No active call from the server's POV → effectively already left.
+        return True
+
+    try:
+        await asyncio.wait_for(
+            userbot.invoke(
+                functions.phone.LeaveGroupCall(call=input_call, source=0)
+            ),
+            timeout=5.0,
+        )
+        LOG.info("raw_leave: phone.LeaveGroupCall succeeded for %s", chat_id)
+        return True
+    except asyncio.TimeoutError:
+        LOG.warning("raw_leave: phone.LeaveGroupCall TIMED OUT for %s", chat_id)
+        return False
+    except Exception as e:
+        err = type(e).__name__.lower()
+        # "GROUPCALL_JOIN_MISSING" or similar → already out
+        if "missing" in err or "notjoined" in err or "groupcall" in err:
+            LOG.info("raw_leave: server reports already-left for %s (%s)", chat_id, err)
+            return True
+        LOG.debug("raw_leave: LeaveGroupCall failed for %s: %s", chat_id, e)
+        return False
+
+
+async def _background_ensure_left(chat_id: int, attempts: int = 6) -> None:
+    """Keep retrying leave in the background for chats that wouldn't leave.
+
+    Runs detached so it never blocks the caller — the user already got the
+    "leaving voice chat" message; we just need the userbot to actually
+    drop out of the call.
+    """
+    for i in range(attempts):
+        await asyncio.sleep(2.5 * (i + 1))  # 2.5, 5, 7.5, 10, 12.5, 15s
+        # Check if pytgcalls says we're still in the call
+        still_in = False
+        try:
+            if pytgcalls is not None:
+                calls = pytgcalls.calls
+                if asyncio.iscoroutine(calls):
+                    calls = await calls
+                if isinstance(calls, dict) and chat_id in calls:
+                    still_in = True
+                elif isinstance(calls, (list, set, tuple)) and chat_id in calls:
+                    still_in = True
+        except Exception:
+            pass
+        if not still_in and not await _raw_leave_check(chat_id):
+            LOG.info("background_ensure_left: %s confirmed out (attempt %d)", chat_id, i + 1)
+            return
+        LOG.info("background_ensure_left: %s still in VC — retry %d/%d",
+                 chat_id, i + 1, attempts)
+        # Try pytgcalls again
+        if pytgcalls is not None:
+            for method_name in ("leave_call", "leave_group_call"):
+                fn = getattr(pytgcalls, method_name, None)
+                if fn is None:
+                    continue
+                try:
+                    await asyncio.wait_for(fn(chat_id), timeout=4.0)
+                    LOG.info("background_ensure_left: %s succeeded via %s", chat_id, method_name)
+                    break
+                except Exception:
+                    continue
+        # And raw fallback
+        try:
+            await _raw_leave_group_call(chat_id)
+        except Exception:
+            pass
+
+
+async def _raw_leave_check(chat_id: int) -> bool:
+    """Return True if the userbot is still listed as a participant in *chat_id*'s GroupCall."""
+    if userbot is None:
+        return False
+    try:
+        from pyrogram.raw import functions
+    except Exception:
+        return False
+    try:
+        peer = await userbot.resolve_peer(chat_id)
+        if hasattr(peer, "channel_id"):
+            full = await userbot.invoke(functions.channels.GetFullChannel(channel=peer))
+        else:
+            full = await userbot.invoke(functions.messages.GetFullChat(chat_id=peer.chat_id))
+        return getattr(full.full_chat, "call", None) is not None
+    except Exception:
+        return False
+
+
 async def leave_voice_chat(chat_id: int) -> None:
     """Leave the voice chat and clean up — best-effort, never raises.
 
@@ -1409,10 +1545,26 @@ async def leave_voice_chat(chat_id: int) -> None:
                 await asyncio.sleep(0.15)
 
     if not left:
-        LOG.error(
-            "leave_voice_chat: could NOT leave %s after retries — forcing local cleanup anyway",
+        LOG.warning(
+            "leave_voice_chat: pytgcalls leave methods failed for %s — trying raw API",
             chat_id,
         )
+        try:
+            left = await _raw_leave_group_call(chat_id)
+        except Exception as e:
+            LOG.debug("leave_voice_chat: raw API leave threw for %s: %s", chat_id, e)
+
+    if not left:
+        LOG.error(
+            "leave_voice_chat: could NOT leave %s after retries — scheduling background retry",
+            chat_id,
+        )
+        # Don't block the user's command — keep trying in the background so the
+        # userbot actually drops out of the VC even if pytgcalls is wedged.
+        try:
+            asyncio.create_task(_background_ensure_left(chat_id))
+        except Exception:
+            pass
 
     # Always clean up state regardless of whether leave succeeded
     _active_chats.discard(chat_id)

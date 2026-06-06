@@ -27,6 +27,7 @@ from MusicLyrics.plugins.play.queue import (
     add_to_queue,
     get_chat_queue,
     format_duration,
+    MAX_QUEUE_SIZE,
 )
 from MusicLyrics.plugins.play.stream import (
     stream_video,
@@ -511,6 +512,16 @@ async def vplay_command(client: Client, message: Message):
     mark_resolved(item)
 
     position = await add_to_queue(chat_id, item)
+
+    # Queue is full — reject so we don't accumulate unbounded work
+    if position == 0:
+        await _safe_edit(
+            status_msg,
+            f"⚠️ **Queue ভর্তি!** ({MAX_QUEUE_SIZE}টা গান সর্বাধিক)\n\n"
+            f"আগের কোনো গান শেষ হলে আবার `/vplay` দিন।",
+        )
+        await _add_reaction(chat_id, message.id)
+        return
 
     if position > 1 and is_active(chat_id):
         try:

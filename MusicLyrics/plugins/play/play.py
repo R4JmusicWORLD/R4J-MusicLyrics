@@ -28,6 +28,7 @@ from MusicLyrics.plugins.play.queue import (
     get_chat_queue,
     clear_queue,
     format_duration,
+    MAX_QUEUE_SIZE,
 )
 from MusicLyrics.plugins.play.stream import (
     stream_audio,
@@ -658,6 +659,16 @@ async def play_command(client: Client, message: Message):
     mark_resolved(item)
 
     position = await add_to_queue(chat_id, item)
+
+    # Queue is full — reject politely so the bot doesn't spawn unbounded work
+    if position == 0:
+        await _safe_edit(
+            status_msg,
+            f"⚠️ **Queue ভর্তি!** ({MAX_QUEUE_SIZE}টা গান সর্বাধিক)\n\n"
+            f"আগের কোনো গান শেষ হলে আবার `/play` দিন।",
+        )
+        await _add_reaction(chat_id, message.id)
+        return
 
     # If something is already playing, just queue it
     if position > 1 and is_active(chat_id):

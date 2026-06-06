@@ -10,6 +10,11 @@ from typing import Optional
 
 LOG = logging.getLogger(__name__)
 
+# Hard cap on number of songs a single chat's queue may hold.
+# Beyond this, /play rejects new tracks so the bot stays responsive and
+# doesn't spawn unbounded prefetch / download work.
+MAX_QUEUE_SIZE: int = 20
+
 
 @dataclass
 class QueueItem:
@@ -69,11 +74,21 @@ async def get_chat_queue(chat_id: int) -> ChatQueue:
 
 
 async def add_to_queue(chat_id: int, item: QueueItem) -> int:
-    """Append *item* and return its 1-based position in the queue."""
+    """Append *item* and return its 1-based position in the queue.
+
+    Returns ``0`` if the queue is already at :data:`MAX_QUEUE_SIZE` — the
+    caller MUST handle this and reply to the user instead of streaming.
+    """
     async with _lock:
         if chat_id not in _queues:
             _queues[chat_id] = ChatQueue()
         cq = _queues[chat_id]
+        if len(cq.items) >= MAX_QUEUE_SIZE:
+            LOG.warning(
+                "Queue %s: FULL (%d/%d) — rejecting '%s'",
+                chat_id, len(cq.items), MAX_QUEUE_SIZE, item.title,
+            )
+            return 0
         cq.items.append(item)
         position = len(cq.items)
     LOG.info("Queue %s: added #%d — %s", chat_id, position, item.title)
