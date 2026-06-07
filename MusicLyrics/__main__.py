@@ -7,7 +7,30 @@ import os
 import signal
 import sys
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+# ── Bounded ThreadPoolExecutor for blocking yt-dlp / network calls ──────
+# Default asyncio executor on Railway free tier has only ~5-6 worker
+# threads (min(32, cpu_count + 4)). When a queue holds 3+ tracks and each
+# track fans out to 4-5 platform fallbacks (YouTube → JioSaavn → Piped →
+# Invidious → SoundCloud) the pool gets exhausted in seconds, asyncio
+# coroutines hang forever, health checks fail and the container is killed
+# ("crash" symptom). A dedicated, larger pool fixes the primary cause.
+EXTRACTOR_EXECUTOR = ThreadPoolExecutor(
+    max_workers=32,
+    thread_name_prefix="extractor",
+)
+
+
+def _install_executor() -> None:
+    """Install EXTRACTOR_EXECUTOR as the default for the running loop."""
+    try:
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+    loop.set_default_executor(EXTRACTOR_EXECUTOR)
 
 # ── LICENSE ENFORCEMENT ──────────────────────────────────────────────────
 # This software is proprietary. See LICENSE file for full terms.
@@ -658,6 +681,16 @@ def _install_global_error_handler():
 async def main():
     """Start the bot, userbot, and py-tgcalls, then idle."""
 
+    # Install the bounded extractor executor BEFORE any blocking call
+    # is scheduled with loop.run_in_executor(None, ...). Otherwise the
+    # tiny default pool gets saturated by yt-dlp / network calls and
+    # the bot hangs on multi-track queues.
+    _install_executor()
+    LOG.info(
+        "Installed bounded ThreadPoolExecutor (max_workers=%d) as loop default.",
+        EXTRACTOR_EXECUTOR._max_workers,
+    )
+
     # Log config summary first so missing vars are immediately visible
     _log_config_summary()
 
@@ -766,6 +799,10 @@ async def main():
         await bot.stop()
     except Exception:
         LOG.exception("Error during shutdown.")
+    try:
+        EXTRACTOR_EXECUTOR.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
     LOG.info("Goodbye.")
 
 
