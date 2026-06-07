@@ -546,6 +546,7 @@ async def vplay_command(client: Client, message: Message):
             chat_id, media_path,
             title=title, duration=duration,
             thumbnail=thumbnail, requester=requester,
+            skip_url_check=True,  # URL was just resolved, no need for HEAD probe
         )
     except FileNotFoundError:
         LOG.exception("Media not found for video stream in %s", chat_id)

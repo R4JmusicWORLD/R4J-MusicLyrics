@@ -210,12 +210,13 @@ async def pre_join_vc(chat_id: int) -> None:
     eliminating the group-join delay from the critical path.
     If already in VC or group, does nothing.
 
-    Join methods tried in order:
-    1. Direct join by chat_id
-    2. Bot creates invite link → assistant joins via link
-    3. Bot adds assistant directly as member (addChatMembers)
+    PARALLEL join: all 4 join methods race simultaneously; the FIRST
+    that succeeds wins and the rest are cancelled.  Each method has a
+    hard timeout so a hung Telegram API call cannot block the others.
+    This collapses the worst-case wait from ~25 s (sequential) down to
+    the slowest single method (~5 s).
     """
-    if pytgcalls is None:
+    if pytgcalls is None or userbot is None:
         return
 
     # Already active? Nothing to do
@@ -235,66 +236,107 @@ async def pre_join_vc(chat_id: int) -> None:
             pass
 
         # Check if assistant is already a member of the group
-        assistant_in_group = False
         try:
-            me = await userbot.get_me()
-            member = await bot.get_chat_member(chat_id, me.id)
-            if member and member.status not in ("left", "kicked", "banned"):
-                assistant_in_group = True
-                LOG.debug("Pre-join: Assistant already in group %s", chat_id)
+            me = await asyncio.wait_for(userbot.get_me(), timeout=3.0)
+            try:
+                member = await asyncio.wait_for(
+                    bot.get_chat_member(chat_id, me.id), timeout=2.5,
+                )
+                if member and getattr(member, "status", None) and \
+                        str(member.status).split(".")[-1].lower() not in ("left", "kicked", "banned", "restricted"):
+                    LOG.debug("Pre-join: Assistant already in group %s", chat_id)
+                    return
+            except Exception:
+                pass
         except Exception:
-            pass
+            me = None
 
-        if assistant_in_group:
-            return
+        # PARALLEL JOIN — race all methods, first success wins.
+        async def _m_direct():
+            await asyncio.wait_for(userbot.join_chat(chat_id), timeout=5.0)
+            return "direct"
 
-        # Method 1: Direct join by chat_id
-        try:
-            await userbot.join_chat(chat_id)
-            LOG.info("Pre-join: Assistant joined group %s by chat_id", chat_id)
-            return
-        except Exception as e:
-            LOG.debug("Pre-join: Direct join failed for %s: %s", chat_id, e)
-
-        # Method 2: Bot creates invite link → assistant joins via link
-        try:
-            invite_link = await bot.export_chat_invite_link(chat_id)
-            if invite_link:
-                await userbot.join_chat(invite_link)
-                LOG.info("Pre-join: Assistant joined group %s via invite link", chat_id)
-                return
-        except Exception as e:
-            LOG.debug("Pre-join: Invite link join failed for %s: %s", chat_id, e)
-
-        # Method 3: Bot creates a fresh invite link → assistant joins
-        try:
-            new_link = await bot.create_chat_invite_link(
-                chat_id, name="Assistant Auto-Join", member_limit=1
+        async def _m_invite():
+            invite_link = await asyncio.wait_for(
+                bot.export_chat_invite_link(chat_id), timeout=3.0,
             )
-            if new_link and new_link.invite_link:
-                await userbot.join_chat(new_link.invite_link)
-                LOG.info("Pre-join: Assistant joined group %s via new invite link", chat_id)
-                # Revoke the one-time link
+            if not invite_link:
+                raise RuntimeError("no invite link")
+            await asyncio.wait_for(userbot.join_chat(invite_link), timeout=5.0)
+            return "invite"
+
+        async def _m_fresh_invite():
+            new_link = await asyncio.wait_for(
+                bot.create_chat_invite_link(
+                    chat_id, name="Assistant Auto-Join", member_limit=1,
+                ),
+                timeout=3.0,
+            )
+            if not (new_link and new_link.invite_link):
+                raise RuntimeError("no fresh invite")
+            link = new_link.invite_link
+            try:
+                await asyncio.wait_for(userbot.join_chat(link), timeout=5.0)
+                return "fresh_invite"
+            finally:
                 try:
-                    await bot.revoke_chat_invite_link(chat_id, new_link.invite_link)
+                    await asyncio.wait_for(
+                        bot.revoke_chat_invite_link(chat_id, link), timeout=2.0,
+                    )
                 except Exception:
                     pass
-                return
-        except Exception as e:
-            LOG.debug("Pre-join: New invite link join failed for %s: %s", chat_id, e)
 
-        # Method 4: Bot adds assistant directly as a member
+        async def _m_add():
+            if me is None:
+                _me = await asyncio.wait_for(userbot.get_me(), timeout=2.5)
+                uid = _me.id
+            else:
+                uid = me.id
+            await asyncio.wait_for(
+                bot.add_chat_members(chat_id, uid), timeout=4.0,
+            )
+            return "add_chat_members"
+
+        tasks = [
+            asyncio.create_task(_m_direct()),
+            asyncio.create_task(_m_invite()),
+            asyncio.create_task(_m_fresh_invite()),
+            asyncio.create_task(_m_add()),
+        ]
+        winner = None
+        last_errors: list[str] = []
+        pending = set(tasks)
         try:
-            me = await userbot.get_me()
-            await bot.add_chat_members(chat_id, me.id)
-            LOG.info("Pre-join: Bot added assistant %s to group %s directly",
-                     me.id, chat_id)
-            return
-        except Exception as e:
-            LOG.debug("Pre-join: Direct add failed for %s: %s", chat_id, e)
+            while pending:
+                done, pending = await asyncio.wait(
+                    pending, return_when=asyncio.FIRST_COMPLETED,
+                )
+                for t in done:
+                    try:
+                        winner = t.result()
+                        break
+                    except Exception as e:
+                        last_errors.append(f"{type(e).__name__}: {e}")
+                if winner is not None:
+                    break
+        finally:
+            for t in pending:
+                t.cancel()
+            # Drain cancellations quietly
+            if pending:
+                try:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                except Exception:
+                    pass
 
-        LOG.warning("Pre-join: All methods failed for %s — will retry in _do_play",
-                    chat_id)
+        if winner is not None:
+            LOG.info("Pre-join: Assistant joined group %s via %s", chat_id, winner)
+        else:
+            LOG.warning(
+                "Pre-join: All parallel methods failed for %s (errors=%s) — "
+                "will retry inside _do_play",
+                chat_id, "; ".join(last_errors[:4]) or "none",
+            )
 
     except Exception as e:
         LOG.debug("Pre-join VC failed for %s: %s", chat_id, e)
@@ -874,69 +916,92 @@ async def _do_play_locked(chat_id: int, stream):
         return
 
     # If first attempt failed, assistant might not be in the group yet.
-    # Try multiple methods to auto-join the group, then retry play.
-    # Timeouts kept short so we don't hang while looking for the group.
+    # Run all join methods in PARALLEL — first success wins.  This cuts
+    # the worst-case wait from ~25 s (sequential 5+8+9+3) down to the
+    # slowest single method (~5 s).
     LOG.info("Play failed for %s — trying to auto-join assistant to the group", chat_id)
-    joined = False
 
-    # Method 1: Direct join by chat_id
-    try:
+    async def _aj_direct():
         await asyncio.wait_for(userbot.join_chat(chat_id), timeout=5.0)
-        joined = True
-        LOG.info("Assistant auto-joined group %s by chat ID", chat_id)
-    except Exception as e:
-        LOG.debug("Assistant join by chat_id failed: %s", e)
+        return "chat_id"
 
-    # Method 2: Bot creates invite link → assistant joins
-    if not joined:
-        try:
-            invite_link = await asyncio.wait_for(
-                bot.export_chat_invite_link(chat_id), timeout=3.0,
-            )
-            if invite_link:
-                await asyncio.wait_for(userbot.join_chat(invite_link), timeout=5.0)
-                joined = True
-                LOG.info("Assistant auto-joined group %s via invite link", chat_id)
-        except Exception as e2:
-            LOG.debug("Assistant join via invite link failed: %s", e2)
+    async def _aj_invite():
+        invite_link = await asyncio.wait_for(
+            bot.export_chat_invite_link(chat_id), timeout=3.0,
+        )
+        if not invite_link:
+            raise RuntimeError("no invite link")
+        await asyncio.wait_for(userbot.join_chat(invite_link), timeout=5.0)
+        return "invite_link"
 
-    # Method 3: Bot creates fresh one-time invite link → assistant joins
-    if not joined:
+    async def _aj_fresh():
+        new_link = await asyncio.wait_for(
+            bot.create_chat_invite_link(
+                chat_id, name="Auto-Join", member_limit=1,
+            ),
+            timeout=3.0,
+        )
+        if not (new_link and new_link.invite_link):
+            raise RuntimeError("no fresh invite")
+        link = new_link.invite_link
         try:
-            new_link = await asyncio.wait_for(
-                bot.create_chat_invite_link(
-                    chat_id, name="Auto-Join", member_limit=1,
-                ),
-                timeout=3.0,
-            )
-            if new_link and new_link.invite_link:
+            await asyncio.wait_for(userbot.join_chat(link), timeout=5.0)
+            return "fresh_invite"
+        finally:
+            try:
                 await asyncio.wait_for(
-                    userbot.join_chat(new_link.invite_link), timeout=5.0,
+                    bot.revoke_chat_invite_link(chat_id, link), timeout=2.0,
                 )
-                joined = True
-                LOG.info("Assistant auto-joined group %s via fresh invite link", chat_id)
-                try:
-                    await bot.revoke_chat_invite_link(chat_id, new_link.invite_link)
-                except Exception:
-                    pass
-        except Exception as e3:
-            LOG.debug("Assistant join via fresh invite link failed: %s", e3)
+            except Exception:
+                pass
 
-    # Method 4: Bot adds assistant directly as member
-    if not joined:
-        try:
-            me = await userbot.get_me()
-            await asyncio.wait_for(
-                bot.add_chat_members(chat_id, me.id), timeout=3.0,
+    async def _aj_add():
+        _me = await asyncio.wait_for(userbot.get_me(), timeout=2.5)
+        await asyncio.wait_for(
+            bot.add_chat_members(chat_id, _me.id), timeout=4.0,
+        )
+        return "add_chat_members"
+
+    join_method = None
+    aj_tasks = [
+        asyncio.create_task(_aj_direct()),
+        asyncio.create_task(_aj_invite()),
+        asyncio.create_task(_aj_fresh()),
+        asyncio.create_task(_aj_add()),
+    ]
+    aj_pending = set(aj_tasks)
+    try:
+        while aj_pending:
+            done, aj_pending = await asyncio.wait(
+                aj_pending, return_when=asyncio.FIRST_COMPLETED,
             )
-            joined = True
-            LOG.info("Bot added assistant %s to group %s directly", me.id, chat_id)
-        except Exception as e4:
-            LOG.debug("Bot add_chat_members failed: %s", e4)
+            for t in done:
+                try:
+                    join_method = t.result()
+                    break
+                except Exception as e:
+                    LOG.debug("auto-join method failed for %s: %s", chat_id, e)
+            if join_method is not None:
+                break
+    finally:
+        for t in aj_pending:
+            t.cancel()
+        if aj_pending:
+            try:
+                await asyncio.gather(*aj_pending, return_exceptions=True)
+            except Exception:
+                pass
 
-    if joined:
-        await asyncio.sleep(0.2)  # Brief pause for Telegram to register the join
-        if await _try_play():
+    if join_method is not None:
+        LOG.info("Assistant auto-joined group %s via %s", chat_id, join_method)
+        # Brief pause so Telegram registers the join before pytgcalls
+        # tries to discover the group call.
+        await asyncio.sleep(0.4)
+        # Reset pytgcalls' native state so the retry play() doesn't
+        # inherit the wedged session from the timed-out attempt above.
+        # Without this reset, pytgcalls keeps thinking it's still in
+        # the call and the next play() hangs again.
+        if await _try_play(reset_first=True):
             return
 
     # All play methods failed — HARD RESET so we never inherit a wedged
