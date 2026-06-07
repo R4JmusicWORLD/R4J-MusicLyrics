@@ -35,6 +35,8 @@ from MusicLyrics.plugins.play.stream import (
     is_active,
     pre_join_vc,
     _now_playing_messages,
+    _add_now_playing,
+    _pop_now_playing,
     _control_keyboard,
     _queue_added_keyboard,
     _get_next_color,
@@ -758,23 +760,17 @@ async def play_command(client: Client, message: Message):
                 caption=text,
                 reply_markup=_control_keyboard(color),
             )
-            # Track this message so we can delete it when track ends
-            if chat_id not in _now_playing_messages:
-                _now_playing_messages[chat_id] = []
-            _now_playing_messages[chat_id].append(now_playing_msg)
+            # Track this message so we can delete it when track ends (thread-safe)
+            await _add_now_playing(chat_id, now_playing_msg)
             await _add_reaction(chat_id, message.id)
         else:
             await status_msg.edit_text(text, reply_markup=_control_keyboard(color))
-            # Track this message
-            if chat_id not in _now_playing_messages:
-                _now_playing_messages[chat_id] = []
-            _now_playing_messages[chat_id].append(status_msg)
+            # Track this message (thread-safe)
+            await _add_now_playing(chat_id, status_msg)
             await _add_reaction(chat_id, message.id)
     except Exception:
         await status_msg.edit_text(text, reply_markup=_control_keyboard(color))
-        if chat_id not in _now_playing_messages:
-            _now_playing_messages[chat_id] = []
-        _now_playing_messages[chat_id].append(status_msg)
+        await _add_now_playing(chat_id, status_msg)
         await _add_reaction(chat_id, message.id)
 
 @bot.on_message(filters.command(["playforce", "pf", "forceplay"]) & not_edited)
@@ -809,17 +805,22 @@ async def playforce_command(client: Client, message: Message):
 
     # Stop current playback if active
     if is_active(chat_id):
-        lock = await acquire_skip_lock(chat_id, timeout=10.0)
+        try:
+            lock = await acquire_skip_lock(chat_id, timeout=15.0)
+        except RuntimeError:
+            await message.reply_text(
+                "⏳ আগের command এখনো চলছে — একটু পরে আবার চেষ্টা করুন।"
+            )
+            return
         try:
             _stop_progress_timer(chat_id)
-            # Delete previous "Now Playing" messages
-            if chat_id in _now_playing_messages:
-                for old_msg in _now_playing_messages[chat_id]:
-                    try:
-                        await old_msg.delete()
-                    except Exception:
-                        pass
-                _now_playing_messages[chat_id].clear()
+            # Delete previous "Now Playing" messages (thread-safe)
+            old_msgs = await _pop_now_playing(chat_id)
+            for old_msg in old_msgs:
+                try:
+                    await old_msg.delete()
+                except Exception:
+                    pass
             await leave_voice_chat(chat_id)
         finally:
             try:
@@ -940,19 +941,13 @@ async def playforce_command(client: Client, message: Message):
                 caption=text,
                 reply_markup=_control_keyboard(color),
             )
-            if chat_id not in _now_playing_messages:
-                _now_playing_messages[chat_id] = []
-            _now_playing_messages[chat_id].append(now_playing_msg)
+            await _add_now_playing(chat_id, now_playing_msg)
             await _add_reaction(chat_id, message.id)
         else:
             await status_msg.edit_text(text, reply_markup=_control_keyboard(color))
-            if chat_id not in _now_playing_messages:
-                _now_playing_messages[chat_id] = []
-            _now_playing_messages[chat_id].append(status_msg)
+            await _add_now_playing(chat_id, status_msg)
             await _add_reaction(chat_id, message.id)
     except Exception:
         await status_msg.edit_text(text, reply_markup=_control_keyboard(color))
-        if chat_id not in _now_playing_messages:
-            _now_playing_messages[chat_id] = []
-        _now_playing_messages[chat_id].append(status_msg)
+        await _add_now_playing(chat_id, status_msg)
         await _add_reaction(chat_id, message.id)

@@ -35,6 +35,7 @@ from MusicLyrics.plugins.play.stream import (
     pre_join_vc,
     leave_voice_chat,
     _now_playing_messages,
+    _add_now_playing,
     _control_keyboard,
     _queue_added_keyboard,
     _get_next_color,
@@ -608,21 +609,15 @@ async def vplay_command(client: Client, message: Message):
                 caption=text,
                 reply_markup=_control_keyboard(color),
             )
-            # Track this message so we can delete it when track ends
-            if chat_id not in _now_playing_messages:
-                _now_playing_messages[chat_id] = []
-            _now_playing_messages[chat_id].append(now_playing_msg)
+            # Track this message so we can delete it when track ends (thread-safe)
+            await _add_now_playing(chat_id, now_playing_msg)
             await _add_reaction(chat_id, message.id)
         else:
             await status_msg.edit_text(text, reply_markup=_control_keyboard(color))
-            # Track this message
-            if chat_id not in _now_playing_messages:
-                _now_playing_messages[chat_id] = []
-            _now_playing_messages[chat_id].append(status_msg)
+            # Track this message (thread-safe)
+            await _add_now_playing(chat_id, status_msg)
             await _add_reaction(chat_id, message.id)
     except Exception:
         await status_msg.edit_text(text, reply_markup=_control_keyboard(color))
-        if chat_id not in _now_playing_messages:
-            _now_playing_messages[chat_id] = []
-        _now_playing_messages[chat_id].append(status_msg)
+        await _add_now_playing(chat_id, status_msg)
         await _add_reaction(chat_id, message.id)

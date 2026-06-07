@@ -11,6 +11,7 @@ import asyncio
 import logging
 import os
 import time
+from collections import defaultdict
 from typing import Optional
 
 from pyrogram.types import (
@@ -70,6 +71,56 @@ _last_successful_platform: dict[int, str] = {}
 # Per-chat lock to prevent race conditions between auto-next and manual skip/stop
 _skip_locks: dict[int, asyncio.Lock] = {}
 
+# Per-chat lock to prevent two concurrent pytgcalls.play() calls in the
+# same chat.  Concurrent calls into pytgcalls' native C extension can
+# segfault and kill the entire Python process — the most common cause of
+# the bot vanishing mid-skip / mid-auto-next.
+_play_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+
+def _get_play_lock(chat_id: int) -> asyncio.Lock:
+    """Return the per-chat play lock (created on first access)."""
+    return _play_locks[chat_id]
+
+
+# Global lock for _now_playing_messages dict mutations.  Without this,
+# multiple coroutines (skip / stop / auto-next / _on_stream_end) mutate
+# the same list concurrently producing
+#     RuntimeError: dictionary changed size during iteration
+# and KeyError, both of which crash the affected handler.
+_NPM_LOCK = asyncio.Lock()
+
+
+async def _add_now_playing(chat_id: int, msg) -> None:
+    """Append a Now Playing message under the global NPM lock."""
+    async with _NPM_LOCK:
+        _now_playing_messages.setdefault(chat_id, []).append(msg)
+
+
+async def _pop_now_playing(chat_id: int) -> list:
+    """Atomically remove and return all Now Playing messages for chat."""
+    async with _NPM_LOCK:
+        return _now_playing_messages.pop(chat_id, [])
+
+
+async def _remove_now_playing(chat_id: int, msg_id: int) -> None:
+    """Remove a single message by id under the NPM lock."""
+    async with _NPM_LOCK:
+        if chat_id in _now_playing_messages:
+            _now_playing_messages[chat_id] = [
+                m for m in _now_playing_messages[chat_id]
+                if getattr(m, "id", None) != msg_id
+            ]
+            if not _now_playing_messages[chat_id]:
+                _now_playing_messages.pop(chat_id, None)
+
+
+# Per-chat flag so _on_stream_end cannot double-fire for the same chat.
+# py-tgcalls occasionally raises StreamAudioEnded twice in rapid
+# succession when a stream is replaced; without this guard each event
+# advances the queue and the user sees songs skipped.
+_END_HANDLING: dict[int, bool] = {}
+
 # TTL-based suppression for stream-end events caused by manual skip/stop
 # replacing streams.  When _do_play replaces the current stream, py-tgcalls
 # fires StreamAudioEnded for the OLD stream.  Without suppression this causes
@@ -128,13 +179,17 @@ def _get_skip_lock(chat_id: int) -> asyncio.Lock:
     return _skip_locks[chat_id]
 
 
-async def acquire_skip_lock(chat_id: int, timeout: float = 5.0) -> asyncio.Lock:
-    """Acquire the skip lock with a timeout.
+async def acquire_skip_lock(chat_id: int, timeout: float = 15.0) -> asyncio.Lock:
+    """Acquire the skip lock with a generous timeout.
 
-    If the existing lock is stuck (held longer than *timeout* seconds — e.g.
-    because a previous pytgcalls.play() hung), drop it and create a fresh
-    one so the new command can proceed.  This prevents the entire chat from
-    becoming unresponsive after a single wedged skip / play.
+    Previously this function "force-replaced" a stuck lock with a fresh
+    one after 5 s — which let the caller proceed while the previous
+    operation was still running, causing two concurrent pytgcalls.play()
+    calls and an eventual segfault.
+
+    Now we simply wait up to *timeout* seconds for the genuine lock; on
+    timeout we raise so the caller can tell the user to retry instead of
+    racing the in-flight operation.
 
     The returned Lock is ALREADY acquired — caller must release it
     (use ``try/finally`` instead of ``async with``).
@@ -145,17 +200,11 @@ async def acquire_skip_lock(chat_id: int, timeout: float = 5.0) -> asyncio.Lock:
         return lock
     except asyncio.TimeoutError:
         LOG.warning(
-            "acquire_skip_lock: lock for %s stuck > %.1fs — forcing fresh lock",
+            "acquire_skip_lock: lock for %s busy > %.1fs — refusing to "
+            "force-replace (would race in-flight play()).",
             chat_id, timeout,
         )
-        # Best-effort: also clear suppression bucket and auto-next flag —
-        # both were probably abandoned by the wedged operation.
-        _suppress_stream_end.pop(chat_id, None)
-        _auto_next_in_progress.discard(chat_id)
-        new_lock = asyncio.Lock()
-        _skip_locks[chat_id] = new_lock
-        await new_lock.acquire()
-        return new_lock
+        raise RuntimeError(f"skip_lock timeout in chat {chat_id}")
 
 async def pre_join_vc(chat_id: int) -> None:
     """Pre-join the voice chat so streaming can start instantly.
@@ -671,6 +720,18 @@ async def _ensure_in_vc(chat_id: int):
 
 
 async def _do_play(chat_id: int, stream):
+    """Public _do_play wrapper that serializes pytgcalls.play() per chat.
+
+    Two concurrent pytgcalls.play() calls in the same chat can crash the
+    native NTgCalls extension and kill the Python process.  A per-chat
+    asyncio.Lock guarantees at most one play() runs at a time for a chat,
+    while other chats remain fully parallel.
+    """
+    async with _get_play_lock(chat_id):
+        await _do_play_locked(chat_id, stream)
+
+
+async def _do_play_locked(chat_id: int, stream):
     """Call pytgcalls.play — join VC if needed, then start streaming.
 
     Compatible with py-tgcalls 2.1.x and 2.2.x APIs.
@@ -1596,9 +1657,7 @@ async def leave_voice_chat(chat_id: int) -> None:
     # Always clean up state regardless of whether leave succeeded
     _active_chats.discard(chat_id)
     # Clear now playing messages tracking (don't delete — user wants messages kept)
-    if chat_id in _now_playing_messages:
-        _now_playing_messages[chat_id].clear()
-        del _now_playing_messages[chat_id]
+    await _pop_now_playing(chat_id)
     # Clean up skip lock, suppression counter and auto-next tracking
     _skip_locks.pop(chat_id, None)
     _suppress_stream_end.pop(chat_id, None)
@@ -1805,7 +1864,7 @@ async def _ensure_assistant_in_vc(chat_id: int) -> None:
 
 # -- Auto-recovering chain player --------------------------------------------
 
-async def _try_play_chain(chat_id: int, first_item, max_attempts: int = 25):
+async def _try_play_chain(chat_id: int, first_item, max_attempts: int = 5):
     """Try playing queue items one after another until one succeeds.
 
     Starts with *first_item* (already popped from the queue by the caller).
@@ -1814,6 +1873,11 @@ async def _try_play_chain(chat_id: int, first_item, max_attempts: int = 25):
     exhausted.  ``max_attempts`` is a hard safety ceiling so a runaway
     queue can never spin forever, but in practice the chain stops as
     soon as the queue is empty.
+
+    Default lowered from 25 → 5: each attempt fans out to 4-5 platform
+    fallbacks internally (YouTube → JioSaavn → Piped → Invidious →
+    SoundCloud), so 25 attempts produced 100+ blocking network calls
+    and exhausted the executor thread pool.  5 is plenty in practice.
 
     Crucially, every attempt routes through
     ``_fresh_resolve_and_play → stream_audio/_video → _do_play``.  Between
@@ -1845,6 +1909,11 @@ async def _try_play_chain(chat_id: int, first_item, max_attempts: int = 25):
     while item is not None and attempt < max_attempts:
         attempt += 1
         title = getattr(item, "title", "?")
+
+        # Brief breath between attempts so we don't hammer the network
+        # / the executor pool with back-to-back fallback chains.
+        if attempt > 1:
+            await asyncio.sleep(0.5)
 
         # Before every attempt (including the first when the assistant may
         # have been dropped by a prior failed play), make sure the
@@ -1951,167 +2020,178 @@ async def _on_stream_end(client, update):
 
     LOG.info("Stream end event for chat %s", chat_id)
 
-    # Suppress events caused by manual skip/stop replacing the current stream.
-    # _do_play triggers StreamAudioEnded for the OLD stream — swallow it here.
-    if _consume_suppression(chat_id):
-        LOG.info("Suppressed stream-end event for %s (TTL-based)", chat_id)
+    # Prevent double-fire: py-tgcalls + the fallback timer can both
+    # deliver an end-event for the same track in rapid succession.
+    # Without this guard the queue advances twice and songs get skipped.
+    if _END_HANDLING.get(chat_id):
+        LOG.debug("Stream-end already being handled for %s, ignoring duplicate", chat_id)
         return
+    _END_HANDLING[chat_id] = True
 
-    # This is a REAL stream-end (track finished naturally).
-    # Defensive: clear any stale suppression bucket so no future event is swallowed.
-    _suppress_stream_end.pop(chat_id, None)
-
-    # Prevent double-processing: if auto-next is already running for this chat, skip
-    if chat_id in _auto_next_in_progress:
-        LOG.info("Auto-next already in progress for %s — ignoring duplicate stream-end event", chat_id)
-        return
-
-    _auto_next_in_progress.add(chat_id)
     try:
-        # Acquire per-chat skip lock — waits if manual skip/stop is in progress.
-        # Timeout-aware so a wedged previous holder cannot freeze auto-next forever.
-        lock = await acquire_skip_lock(chat_id, timeout=5.0)
+        # Suppress events caused by manual skip/stop replacing the current stream.
+        # _do_play triggers StreamAudioEnded for the OLD stream — swallow it here.
+        if _consume_suppression(chat_id):
+            LOG.info("Suppressed stream-end event for %s (TTL-based)", chat_id)
+            return
+
+        # This is a REAL stream-end (track finished naturally).
+        # Defensive: clear any stale suppression bucket so no future event is swallowed.
+        _suppress_stream_end.pop(chat_id, None)
+
+        # Prevent double-processing: if auto-next is already running for this chat, skip
+        if chat_id in _auto_next_in_progress:
+            LOG.info("Auto-next already in progress for %s — ignoring duplicate stream-end event", chat_id)
+            return
+
+        _auto_next_in_progress.add(chat_id)
         try:
-            # Re-check if chat is still active (may have been stopped while waiting for lock)
-            if chat_id not in _active_chats:
-                LOG.info("Chat %s no longer active, skipping auto-next", chat_id)
+            # Acquire per-chat skip lock — waits if manual skip/stop is in progress.
+            # Raises RuntimeError if a previous play() is still in flight; in that
+            # case the in-flight call will produce its own stream-end so we can
+            # safely skip handling this one.
+            try:
+                lock = await acquire_skip_lock(chat_id, timeout=15.0)
+            except RuntimeError:
+                LOG.warning(
+                    "auto-next: skip_lock busy for %s — deferring to in-flight op",
+                    chat_id,
+                )
                 return
+            try:
+                # Re-check if chat is still active (may have been stopped while waiting for lock)
+                if chat_id not in _active_chats:
+                    LOG.info("Chat %s no longer active, skipping auto-next", chat_id)
+                    return
 
-            # Stop the progress timer
-            _stop_progress_timer(chat_id)
+                # Stop the progress timer
+                _stop_progress_timer(chat_id)
 
-            # Get the finished track info BEFORE cleaning up
-            finished = await get_current(chat_id)
-            finished_title = finished.title if finished else "Unknown"
-            finished_requester = finished.requester if finished else ""
+                # Get the finished track info BEFORE cleaning up
+                finished = await get_current(chat_id)
+                finished_title = finished.title if finished else "Unknown"
+                finished_requester = finished.requester if finished else ""
 
-            # Determine next item FIRST so we can tell loop mode from advance.
-            next_item = await skip_queue(chat_id, force=False)
+                # Determine next item FIRST so we can tell loop mode from advance.
+                next_item = await skip_queue(chat_id, force=False)
 
-            # Clean up the finished track's file ONLY if we're actually
-            # advancing to a different item.  In loop mode skip_queue
-            # returns the SAME item — deleting its file before replay
-            # would break the loop.
-            is_loop_replay = (
-                finished is not None
-                and next_item is not None
-                and finished is next_item
-            )
-            if (
-                finished
-                and not finished.is_stream_url
-                and finished.media_path
-                and not is_loop_replay
-            ):
-                cleanup(finished.media_path)
+                # Clean up the finished track's file ONLY if we're actually
+                # advancing to a different item.  In loop mode skip_queue
+                # returns the SAME item — deleting its file before replay
+                # would break the loop.
+                is_loop_replay = (
+                    finished is not None
+                    and next_item is not None
+                    and finished is next_item
+                )
+                if (
+                    finished
+                    and not finished.is_stream_url
+                    and finished.media_path
+                    and not is_loop_replay
+                ):
+                    cleanup(finished.media_path)
 
-            # Delete previous "Now Playing" / thumbnail messages for this chat
-            if chat_id in _now_playing_messages:
-                for old_msg in _now_playing_messages[chat_id]:
+                # Delete previous "Now Playing" / thumbnail messages (thread-safe)
+                old_msgs = await _pop_now_playing(chat_id)
+                for old_msg in old_msgs:
                     try:
                         await old_msg.delete()
                         LOG.debug("Deleted previous Now Playing message in %s", chat_id)
                     except Exception:
                         pass
-                _now_playing_messages[chat_id].clear()
 
-            if next_item is None:
-                # Queue is empty — send "song ended" message with add-to-group button
+                if next_item is None:
+                    # Queue is empty — send "song ended" message with add-to-group button
+                    try:
+                        t = _get_current_theme()
+                        finish_msg = await bot.send_message(
+                            chat_id,
+                            f"▸ **ꜱᴏɴɢ ᴇɴᴅᴇᴅ** ✅\n\n"
+                            f"{t['title_icon']} **ꜱʜᴇꜱʜ ɢᴀᴀɴ:** {finished_title}\n"
+                            f"👤 **ꜱʜᴜɴɪʏᴇᴄʜɪʟᴇɴ:** {finished_requester}\n\n"
+                            f"🔄 আবার গান শুনতে `/play` কমান্ড দিন।\n\n"
+                            f"🦋 ✦ᴘᴏᴡєʀєᴅ ʙʏ » ── [@R4J_81](https://t.me/R4J_81)",
+                            reply_markup=_song_ended_keyboard(),
+                        )
+                        await _add_reaction(chat_id, finish_msg.id)
+                    except Exception:
+                        pass
+                    # Now leave the voice chat
+                    await leave_voice_chat(chat_id)
+                    LOG.info("Queue empty, left voice chat in %s", chat_id)
+                    return
+
+                # Play next track (INSIDE lock to prevent race with manual skip)
+                # Remove from _active_chats so _do_play does NOT add a false
+                # suppress_next_stream_end (the old stream already ended naturally,
+                # there is no old-stream event to suppress).
+                _active_chats.discard(chat_id)
+
                 try:
+                    # 5 attempts is plenty — 25 was overkill and exhausted the
+                    # extractor pool (each attempt fans out to 4-5 platforms).
+                    played = await _try_play_chain(chat_id, next_item, max_attempts=5)
+
+                    if played is None:
+                        try:
+                            err_msg = await bot.send_message(
+                                chat_id,
+                                "❌ **Queue শেষ — পরের কোনো গান চালানো যায়নি।**\n\n"
+                                "Voice chat থেকে বের হচ্ছি। আবার `/play` দিন।",
+                            )
+                            await _add_reaction(chat_id, err_msg.id)
+                        except Exception:
+                            pass
+                        await leave_voice_chat(chat_id)
+                        return
+
+                    # The item that actually started playing may not be the
+                    # first one we tried — use the returned item for UI.
+                    next_item = played
+
+                    dur = format_duration(next_item.duration)
+                    color = _get_next_color()
+
+                    # Start progress timer for the new track
+                    await _start_progress_timer(chat_id, next_item.duration)
+
                     t = _get_current_theme()
-                    finish_msg = await bot.send_message(
+                    np_msg = await bot.send_message(
                         chat_id,
-                        f"▸ **ꜱᴏɴɢ ᴇɴᴅᴇᴅ** ✅\n\n"
-                        f"{t['title_icon']} **ꜱʜᴇꜱʜ ɢᴀᴀɴ:** {finished_title}\n"
-                        f"👤 **ꜱʜᴜɴɪʏᴇᴄʜɪʟᴇɴ:** {finished_requester}\n\n"
-                        f"🔄 আবার গান শুনতে `/play` কমান্ড দিন।\n\n"
-                        f"🦋 ✦ᴘᴏᴡєʀєᴅ ʙʏ » ── [@R4J_81](https://t.me/R4J_81)",
-                        reply_markup=_song_ended_keyboard(),
+                        f"{t['header']} **ᴘʟᴀʏʙᴀᴄᴋ ᴀᴄᴛɪᴠᴀᴛᴇᴅ | ᴇɴᴊᴏʏ ᴛʜᴇ ᴍᴜꜱɪᴄ**\n\n"
+                        f"> {t['title_icon']}  **ᴛɪᴛʟᴇ :** [{next_item.title}]({next_item.url})\n"
+                        f"> {t['dur_icon']}  **ᴅᴜʀᴀᴛɪᴏɴ :** {dur}\n"
+                        f"> 👤  **ʀᴇǫᴜᴇꜱᴛᴇᴅ :** {next_item.requester}"
+                        f"\n\n🦋 ✦ᴘᴏᴡєʀєᴅ ʙʏ » ── [@R4J_81](https://t.me/R4J_81)",
+                        reply_markup=_control_keyboard(color),
                     )
-                    await _add_reaction(chat_id, finish_msg.id)
+                    # Add reaction to the now playing message
+                    await _add_reaction(chat_id, np_msg.id)
+                    # Track this message (thread-safe)
+                    await _add_now_playing(chat_id, np_msg)
                 except Exception:
-                    pass
-                # Now leave the voice chat
-                await leave_voice_chat(chat_id)
-                LOG.info("Queue empty, left voice chat in %s", chat_id)
-                return
-
-            # Play next track (INSIDE lock to prevent race with manual skip)
-            # Remove from _active_chats so _do_play does NOT add a false
-            # suppress_next_stream_end (the old stream already ended naturally,
-            # there is no old-stream event to suppress).
-            _active_chats.discard(chat_id)
-
-            try:
-                # Try playing the next track AND, if it fails, walk further
-                # down the queue trying each subsequent item.  This is what
-                # prevents the chat from getting stuck: a single bad track
-                # no longer kicks the bot out of the voice chat.
-                # _try_play_chain rejoins the VC between attempts so the
-                # assistant comes back even if an earlier attempt dropped
-                # it.  max_attempts=25 just caps runaway loops; the chain
-                # stops naturally when the queue is empty.
-                played = await _try_play_chain(chat_id, next_item, max_attempts=25)
-
-                if played is None:
+                    LOG.exception("Failed to play next in queue for %s", chat_id)
+                    # Send error message before leaving
                     try:
                         err_msg = await bot.send_message(
                             chat_id,
-                            "❌ **Queue শেষ — পরের কোনো গান চালানো যায়নি।**\n\n"
-                            "Voice chat থেকে বের হচ্ছি। আবার `/play` দিন।",
+                            f"❌ **পরের গানটি চলানো যায়নি:** {next_item.title}\n\n"
+                            "Voice chat থেকে বের হচ্ছে। আবার `/play` দিন।",
                         )
                         await _add_reaction(chat_id, err_msg.id)
                     except Exception:
                         pass
                     await leave_voice_chat(chat_id)
-                    return
-
-                # The item that actually started playing may not be the
-                # first one we tried — use the returned item for UI.
-                next_item = played
-
-                dur = format_duration(next_item.duration)
-                color = _get_next_color()
-
-                # Start progress timer for the new track
-                await _start_progress_timer(chat_id, next_item.duration)
-
-                t = _get_current_theme()
-                np_msg = await bot.send_message(
-                    chat_id,
-                    f"{t['header']} **ᴘʟᴀʏʙᴀᴄᴋ ᴀᴄᴛɪᴠᴀᴛᴇᴅ | ᴇɴᴊᴏʏ ᴛʜᴇ ᴍᴜꜱɪᴄ**\n\n"
-                    f"> {t['title_icon']}  **ᴛɪᴛʟᴇ :** [{next_item.title}]({next_item.url})\n"
-                    f"> {t['dur_icon']}  **ᴅᴜʀᴀᴛɪᴏɴ :** {dur}\n"
-                    f"> 👤  **ʀᴇǫᴜᴇꜱᴛᴇᴅ :** {next_item.requester}"
-                    f"\n\n🦋 ✦ᴘᴏᴡєʀєᴅ ʙʏ » ── [@R4J_81](https://t.me/R4J_81)",
-                    reply_markup=_control_keyboard(color),
-                )
-                # Add reaction to the now playing message
-                await _add_reaction(chat_id, np_msg.id)
-                # Track this message so we can delete it when this track ends
-                if chat_id not in _now_playing_messages:
-                    _now_playing_messages[chat_id] = []
-                _now_playing_messages[chat_id].append(np_msg)
-            except Exception:
-                LOG.exception("Failed to play next in queue for %s", chat_id)
-                # Send error message before leaving
+            finally:
                 try:
-                    err_msg = await bot.send_message(
-                        chat_id,
-                        f"❌ **পরের গানটি চলানো যায়নি:** {next_item.title}\n\n"
-                        "Voice chat থেকে বের হচ্ছে। আবার `/play` দিন।",
-                    )
-                    await _add_reaction(chat_id, err_msg.id)
+                    lock.release()
                 except Exception:
                     pass
-                await leave_voice_chat(chat_id)
         finally:
-            try:
-                lock.release()
-            except Exception:
-                pass
+            _auto_next_in_progress.discard(chat_id)
     finally:
-        _auto_next_in_progress.discard(chat_id)
+        _END_HANDLING.pop(chat_id, None)
 
 
 # Register the stream-end callback with compatibility for multiple py-tgcalls versions
@@ -2359,9 +2439,7 @@ if pytgcalls is not None:
                 LOG.info("Userbot kicked from voice chat in %s — cleaning up", chat_id)
                 _stop_progress_timer(chat_id)
                 _active_chats.discard(chat_id)
-                if chat_id in _now_playing_messages:
-                    _now_playing_messages[chat_id].clear()
-                    del _now_playing_messages[chat_id]
+                await _pop_now_playing(chat_id)
                 _auto_next_in_progress.discard(chat_id)
                 await clear_queue(chat_id)
     except (AttributeError, TypeError) as e:
@@ -2382,9 +2460,7 @@ if pytgcalls is not None:
                     LOG.info("Userbot left voice chat in %s — cleaning up", left_chat)
                     _stop_progress_timer(left_chat)
                     _active_chats.discard(left_chat)
-                    if left_chat in _now_playing_messages:
-                        _now_playing_messages[left_chat].clear()
-                        del _now_playing_messages[left_chat]
+                    await _pop_now_playing(left_chat)
                     _auto_next_in_progress.discard(left_chat)
                     await clear_queue(left_chat)
             LOG.info("Left voice chat handler registered via pytgcalls.filters.left")

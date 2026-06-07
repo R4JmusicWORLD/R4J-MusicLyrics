@@ -37,6 +37,9 @@ from MusicLyrics.plugins.play.stream import (
     stream_video,
     is_active,
     _now_playing_messages,
+    _add_now_playing,
+    _pop_now_playing,
+    _remove_now_playing,
     _control_keyboard,
     _get_next_color,
     _get_current_theme,
@@ -141,22 +144,27 @@ async def skip_cmd(client: Client, message: Message):
         return
 
     # Acquire skip lock to prevent race with auto-next.
-    # acquire_skip_lock has a built-in timeout — if the previous holder
-    # wedged (e.g. pytgcalls.play() hung), the lock is force-replaced so
-    # this command can still proceed instead of deadlocking forever.
-    lock = await acquire_skip_lock(chat_id, timeout=5.0)
+    # Generous 15 s timeout; if a previous operation is genuinely still
+    # running we tell the user to retry instead of racing it (which used
+    # to crash pytgcalls).
+    try:
+        lock = await acquire_skip_lock(chat_id, timeout=15.0)
+    except RuntimeError:
+        await message.reply_text(
+            "⏳ আগের command এখনো চলছে — একটু পরে আবার চেষ্টা করুন।"
+        )
+        return
     try:
         # Stop progress timer
         _stop_progress_timer(chat_id)
 
-        # Delete previous "Now Playing" messages
-        if chat_id in _now_playing_messages:
-            for old_msg in _now_playing_messages[chat_id]:
-                try:
-                    await old_msg.delete()
-                except Exception:
-                    pass
-            _now_playing_messages[chat_id].clear()
+        # Delete previous "Now Playing" messages (thread-safe)
+        old_msgs = await _pop_now_playing(chat_id)
+        for old_msg in old_msgs:
+            try:
+                await old_msg.delete()
+            except Exception:
+                pass
 
         next_item = await skip_queue(chat_id, force=True)
         if next_item is None:
@@ -175,13 +183,11 @@ async def skip_cmd(client: Client, message: Message):
             # Adding it here causes DOUBLE suppression — the real stream-end
             # for the NEW track also gets swallowed, breaking auto-next.
 
-            # Try the picked track AND, if it fails, keep walking down the
-            # queue trying subsequent items.  _try_play_chain rejoins the
-            # voice chat between attempts so a single bad track can't
-            # strand the bot outside the VC.  We walk the WHOLE queue
-            # (max_attempts is just a safety ceiling); the chain stops
-            # naturally as soon as the queue is empty.
-            played = await _try_play_chain(chat_id, next_item, max_attempts=25)
+            # Walk a small number of items if the picked one fails.  25 was
+            # excessive — each attempt does 4-5 platform fallbacks so 25
+            # produced 100+ blocking network calls and exhausted the
+            # extractor pool.  5 attempts is plenty in practice.
+            played = await _try_play_chain(chat_id, next_item, max_attempts=5)
 
             if played is None:
                 # Queue truly exhausted or every attempt failed.  Only
@@ -212,10 +218,8 @@ async def skip_cmd(client: Client, message: Message):
                 reply_markup=_control_keyboard(color),
             )
             await _add_reaction(chat_id, message.id)
-            # Track this new "Now Playing" message
-            if chat_id not in _now_playing_messages:
-                _now_playing_messages[chat_id] = []
-            _now_playing_messages[chat_id].append(reply)
+            # Track this new "Now Playing" message (thread-safe)
+            await _add_now_playing(chat_id, reply)
         except Exception:
             LOG.exception("Skip failed in %s", chat_id)
             reply = await message.reply_text("❌ পরের গানে যেতে সমস্যা হয়েছে।")
@@ -237,22 +241,27 @@ async def stop_cmd(client: Client, message: Message):
         await _add_reaction(chat_id, message.id)
         return
 
-    # Acquire skip lock to prevent race with auto-next.
-    # Timeout-aware acquire: if a previous play() wedged, we replace the
-    # lock so /stop always works.
-    lock = await acquire_skip_lock(chat_id, timeout=5.0)
+    # Acquire skip lock with generous timeout.  Raises RuntimeError if a
+    # previous play() is still in flight — we tell the user to retry
+    # rather than racing the in-flight call (which crashed pytgcalls).
+    try:
+        lock = await acquire_skip_lock(chat_id, timeout=15.0)
+    except RuntimeError:
+        await message.reply_text(
+            "⏳ আগের command এখনো চলছে — একটু পরে আবার চেষ্টা করুন।"
+        )
+        return
     try:
         # Stop progress timer
         _stop_progress_timer(chat_id)
 
-        # Delete previous "Now Playing" messages
-        if chat_id in _now_playing_messages:
-            for old_msg in _now_playing_messages[chat_id]:
-                try:
-                    await old_msg.delete()
-                except Exception:
-                    pass
-            _now_playing_messages[chat_id].clear()
+        # Delete previous "Now Playing" messages (thread-safe)
+        old_msgs = await _pop_now_playing(chat_id)
+        for old_msg in old_msgs:
+            try:
+                await old_msg.delete()
+            except Exception:
+                pass
 
         await leave_voice_chat(chat_id)
         reply = await message.reply_text(
@@ -472,10 +481,19 @@ async def cb_skip(client: Client, callback: CallbackQuery):
     except Exception:
         pass
 
-    # Acquire skip lock to prevent race with auto-next.
-    # acquire_skip_lock force-replaces a wedged lock so the chat never
-    # becomes unresponsive after a single bad skip.
-    lock = await acquire_skip_lock(chat_id, timeout=5.0)
+    # Acquire skip lock with generous timeout — refuse on collision
+    # instead of force-replacing (which used to race the in-flight call
+    # and crash pytgcalls).
+    try:
+        lock = await acquire_skip_lock(chat_id, timeout=15.0)
+    except RuntimeError:
+        try:
+            await callback.message.reply_text(
+                "⏳ আগের command এখনো চলছে — একটু পরে আবার চেষ্টা করুন।"
+            )
+        except Exception:
+            pass
+        return
     try:
         if not is_active(chat_id):
             return
@@ -483,14 +501,13 @@ async def cb_skip(client: Client, callback: CallbackQuery):
         # Stop progress timer
         _stop_progress_timer(chat_id)
 
-        # Delete previous "Now Playing" messages
-        if chat_id in _now_playing_messages:
-            for old_msg in _now_playing_messages[chat_id]:
-                try:
-                    await old_msg.delete()
-                except Exception:
-                    pass
-            _now_playing_messages[chat_id].clear()
+        # Delete previous "Now Playing" messages (thread-safe)
+        old_msgs = await _pop_now_playing(chat_id)
+        for old_msg in old_msgs:
+            try:
+                await old_msg.delete()
+            except Exception:
+                pass
 
         next_item = await skip_queue(chat_id, force=True)
         if next_item is None:
@@ -507,15 +524,10 @@ async def cb_skip(client: Client, callback: CallbackQuery):
         try:
             # NOTE: Do NOT call suppress_next_stream_end here!
             # _do_play() already handles suppression internally.
-            # Double suppression causes the NEW track's stream-end to be
-            # swallowed too, breaking auto-next / sequential playback.
 
-            # Try the picked track AND, if it fails, keep walking down the
-            # queue trying subsequent items.  _try_play_chain rejoins the
-            # voice chat between attempts so a single bad track can't
-            # strand the bot outside the VC.  Walk the WHOLE queue —
-            # max_attempts is just a safety ceiling.
-            played = await _try_play_chain(chat_id, next_item, max_attempts=25)
+            # 5 attempts is plenty — 25 was overkill (each attempt fans
+            # out to 4-5 platforms = up to 100+ blocking calls).
+            played = await _try_play_chain(chat_id, next_item, max_attempts=5)
 
             if played is None:
                 try:
@@ -545,10 +557,8 @@ async def cb_skip(client: Client, callback: CallbackQuery):
                 f"🦋 ✦ᴘᴏᴡєʀєᴅ ʙʏ » ── [@R4J_81](https://t.me/R4J_81)",
                 reply_markup=_control_keyboard(color),
             )
-            # Track this new "Now Playing" message
-            if chat_id not in _now_playing_messages:
-                _now_playing_messages[chat_id] = []
-            _now_playing_messages[chat_id].append(reply)
+            # Track this new "Now Playing" message (thread-safe)
+            await _add_now_playing(chat_id, reply)
         except Exception:
             LOG.exception("Skip callback failed in %s", chat_id)
             try:
@@ -577,12 +587,9 @@ async def cb_stop(client: Client, callback: CallbackQuery):
     except Exception:
         pass
 
-    # Remove this message from the tracking list
+    # Remove this message from the tracking list (thread-safe)
     msg_id = callback.message.id
-    if chat_id in _now_playing_messages:
-        _now_playing_messages[chat_id] = [
-            m for m in _now_playing_messages[chat_id] if m.id != msg_id
-        ]
+    await _remove_now_playing(chat_id, msg_id)
 
     # Delete only this message
     try:
