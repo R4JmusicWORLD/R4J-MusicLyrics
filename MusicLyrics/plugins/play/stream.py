@@ -1853,13 +1853,50 @@ async def _ensure_assistant_in_vc(chat_id: int) -> None:
     even timeout entirely — leaving the bot "stuck outside the VC and not
     playing the next song".
 
-    This helper performs the rejoin BEFORE the next play attempt so the
-    chat-play chain stays responsive instead of stalling.
+    Steps performed (in order — each is best-effort, failures are logged
+    and ignored so we always reach pre_join_vc):
+
+    1. Discard stale ``_active_chats`` bookkeeping.
+    2. Drop the stale suppression bucket (otherwise the NEXT play's first
+       real stream-end is silently swallowed).
+    3. Tell pytgcalls to leave the call — clears its NATIVE C-extension
+       call state for this chat so the next ``play()`` starts fresh.
+       Without this, pytgcalls keeps thinking the assistant is in a call
+       and the next play() inherits a wedged WebRTC session.
+    4. Run pre_join_vc so the assistant is a member of the group.
     """
     if pytgcalls is None or userbot is None:
         return
-    # Drop stale bookkeeping so pre_join_vc actually runs.
+
+    # 1 + 2: drop stale bookkeeping so the next play() doesn't suppress
+    # the new track's first real stream-end and pre_join_vc actually runs.
     _active_chats.discard(chat_id)
+    _suppress_stream_end.pop(chat_id, None)
+
+    # 3: clear pytgcalls' native call state for this chat.  Try both
+    # pytgcalls leave methods AND the raw API leave so a wedged pytgcalls
+    # connection cannot keep us "stuck in a phantom call".
+    for method_name in ("leave_call", "leave_group_call"):
+        fn = getattr(pytgcalls, method_name, None)
+        if fn is None:
+            continue
+        try:
+            await asyncio.wait_for(fn(chat_id), timeout=2.0)
+            LOG.debug("_ensure_assistant_in_vc: %s ok for %s", method_name, chat_id)
+            break
+        except Exception as e:
+            LOG.debug("_ensure_assistant_in_vc: %s failed for %s: %s",
+                      method_name, chat_id, e)
+    # Raw-API leave as belt-and-suspenders — succeeds even if pytgcalls is wedged.
+    try:
+        await _raw_leave_group_call(chat_id)
+    except Exception as e:
+        LOG.debug("_ensure_assistant_in_vc: raw leave failed for %s: %s", chat_id, e)
+
+    # Give Telegram a beat to register the leave before we ask to rejoin.
+    await asyncio.sleep(0.3)
+
+    # 4: ensure assistant is actually a member of the group.
     try:
         await asyncio.wait_for(pre_join_vc(chat_id), timeout=8.0)
     except asyncio.TimeoutError:
@@ -1923,14 +1960,17 @@ async def _try_play_chain(chat_id: int, first_item, max_attempts: int = 5):
 
         # Before every attempt (including the first when the assistant may
         # have been dropped by a prior failed play), make sure the
-        # assistant is back in the VC.  Skipping the first attempt's
-        # rejoin would be slightly faster but pre_join_vc returns
-        # instantly when nothing has to change, so cost is negligible.
-        if attempt > 1:
+        # assistant is back in the VC.  The first-attempt rejoin runs only
+        # when the chat is NOT currently active — that way a healthy live
+        # /skip stays instant, while auto-next after a wedged play (which
+        # already cleared _active_chats) still gets the strong-arm rejoin
+        # before its very first new-track play attempt.
+        needs_rejoin = (attempt > 1) or (chat_id not in _active_chats)
+        if needs_rejoin:
             try:
                 await _ensure_assistant_in_vc(chat_id)
             except Exception as e:
-                LOG.debug("_try_play_chain: rejoin between attempts failed: %s", e)
+                LOG.debug("_try_play_chain: rejoin before attempt failed: %s", e)
 
         try:
             success = await asyncio.wait_for(
